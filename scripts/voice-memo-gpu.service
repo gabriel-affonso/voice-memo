@@ -7,10 +7,9 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/voice-memo
 EnvironmentFile=/opt/voice-memo/.env
-ExecStart=/opt/voice-memo/.venv/bin/python -m voice_memo.gpu_server
+ExecStart=/opt/voice-memo/scripts/run_gpu.sh
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-

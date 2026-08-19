@@ -5,4 +5,5 @@ pydantic>=2.7
 python-dotenv>=1.0
 requests>=2.32
 faster-whisper>=1.0
-
+nvidia-cublas-cu12>=12,<13
+nvidia-cudnn-cu12==9.*
