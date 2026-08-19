@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -107,10 +106,13 @@ class Settings:
     notion_processor_property: str = _env("NOTION_PROCESSOR_PROPERTY")
     notion_status_property: str = _env("NOTION_STATUS_PROPERTY")
     notion_status_value: str = _env("NOTION_STATUS_VALUE")
-    notion_system_status_property: str = _env("NOTION_SYSTEM_STATUS_PROPERTY")
-    notion_system_status_value: str = _env("NOTION_SYSTEM_STATUS_VALUE")
-    notion_created_property: str = _env("NOTION_CREATED_PROPERTY")
-    notion_created_date: str = _env("NOTION_CREATED_DATE", date.today().isoformat())
+    notion_system_status_property: str = _env(
+        "NOTION_SYSTEM_STATUS_PROPERTY",
+        "Status do sistema",
+    )
+    notion_system_status_value: str = _env("NOTION_SYSTEM_STATUS_VALUE", "Processed")
+    notion_created_property: str = _env("NOTION_CREATED_PROPERTY", "Created")
+    notion_created_date: str = _env("NOTION_CREATED_DATE")
 
     # Server
     gpu_host: str = os.getenv("GPU_HOST", "0.0.0.0")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import requests
@@ -79,7 +80,7 @@ class NotionClient:
         self._add_date_property(
             properties,
             self.settings.notion_created_property,
-            self.settings.notion_created_date,
+            self.settings.notion_created_date or self._now_iso(),
         )
 
         payload = {
@@ -173,11 +174,11 @@ class NotionClient:
         processor: str,
     ) -> list[dict[str, Any]]:
         blocks: list[dict[str, Any]] = []
+        self._append_section(blocks, "Nota processada", note.clean_note)
         self._append_section(blocks, "Resumo", note.summary)
-        self._append_section(blocks, "Nota", note.clean_note)
-        self._append_section(blocks, "Tarefas", self._format_tasks(note))
-        self._append_section(blocks, "Transcrição", transcript)
-        self._append_section(blocks, "Metadados", f"Source: {source}\nProcessor: {processor}")
+        self._append_tasks(blocks, note)
+        blocks.append({"object": "block", "type": "divider", "divider": {}})
+        self._append_section(blocks, "Transcrição original", transcript)
         return blocks
 
     def _append_section(self, blocks: list[dict[str, Any]], heading: str, text: str) -> None:
@@ -201,6 +202,30 @@ class NotionClient:
                 }
             )
 
+    def _append_tasks(self, blocks: list[dict[str, Any]], note: ProcessedNote) -> None:
+        if not note.tasks:
+            return
+
+        blocks.append(
+            {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": self._rich_text("Tarefas")},
+            }
+        )
+        for task in note.tasks:
+            due = f" | {task.due}" if task.due else ""
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "to_do",
+                    "to_do": {
+                        "rich_text": self._rich_text(f"{task.text}{due}"),
+                        "checked": False,
+                    },
+                }
+            )
+
     def _rich_text(self, value: str) -> list[dict[str, Any]]:
         text = value.strip()
         if not text:
@@ -218,3 +243,6 @@ class NotionClient:
             due = f" | {task.due}" if task.due else ""
             lines.append(f"- {task.text}{due}")
         return "\n".join(lines)
+
+    def _now_iso(self) -> str:
+        return datetime.now().astimezone().isoformat(timespec="seconds")

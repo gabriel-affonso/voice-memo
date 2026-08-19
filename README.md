@@ -113,6 +113,7 @@ NOTION_PROCESSOR_PROPERTY=
 ```
 
 Se uma propriedade estiver vazia, o VoiceMemo não tenta escrever nela. O conteúdo completo da nota, resumo, tarefas, transcrição e metadados é salvo como blocos no corpo da página.
+As tarefas são salvas como checkboxes no corpo da página quando existirem. Se `NOTION_CREATED_PROPERTY=Created`, o VoiceMemo preenche data e hora de criação.
 
 Rode:
 

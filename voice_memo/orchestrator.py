@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -152,7 +153,7 @@ class VoiceMemoOrchestrator:
             self.telegram.send_message(
                 chat_id=job.telegram_chat_id,
                 reply_to_message_id=job.telegram_message_id,
-                text=self.format_success_message(result),
+                text=self.format_success_message(result, page_id),
             )
         except Exception:
             LOGGER.exception("Job %s foi salvo, mas a confirmação no Telegram falhou.", job.id)
@@ -169,22 +170,41 @@ class VoiceMemoOrchestrator:
 
         return self.cloud.process(audio_path)
 
-    def format_success_message(self, result: ProcessResponse) -> str:
+    def format_success_message(self, result: ProcessResponse, page_id: str | None = None) -> str:
         tasks = "\n".join(
-            f"- {task.text}{f' | {task.due}' if task.due else ''}"
+            f"☐ {task.text}{f' | {task.due}' if task.due else ''}"
             for task in result.note.tasks
         )
         if not tasks:
             tasks = "Nenhuma tarefa detectada."
 
-        tags = ", ".join(result.note.tags)
-        return (
-            f"Nota salva no Notion.\n\n"
-            f"TITLE\n{result.note.title}\n\n"
-            f"SUMMARY\n{result.note.summary}\n\n"
-            f"TASKS\n{tasks}\n\n"
-            f"TAGS\n{tags}"
+        tags = " ".join(f"#{self._hashtag(tag)}" for tag in result.note.tags)
+        notion_link = f"\n\n🔗 Abrir no Notion:\n{self._notion_url(page_id)}" if page_id else ""
+        prefix = (
+            f"✅ Nota processada\n\n"
+            f"📝 {result.note.title}\n\n"
+            f"{result.note.clean_note}\n\n"
+            f"📌 Resumo\n"
+            f"{result.note.summary}\n\n"
+            f"✅ Tarefas\n"
+            f"{tasks}\n\n"
+            f"🏷️ {tags}\n\n"
+            f"____________________\n\n"
+            f"🎙️ Transcrição original\n"
         )
+        transcript = result.transcript
+        max_transcript_len = 4000 - len(prefix) - len(notion_link)
+        if max_transcript_len < 100:
+            max_transcript_len = 100
+        if len(transcript) > max_transcript_len:
+            transcript = transcript[: max_transcript_len - 20].rstrip() + "\n...[cortado]"
+        return prefix + transcript + notion_link
+
+    def _hashtag(self, tag: str) -> str:
+        return re.sub(r"\s+", "", tag)
+
+    def _notion_url(self, page_id: str) -> str:
+        return f"https://www.notion.so/{page_id.replace('-', '')}"
 
 
 def main() -> None:
