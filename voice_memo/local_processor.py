@@ -44,8 +44,12 @@ class LocalProcessor:
             "messages": build_note_prompt(transcript),
             "stream": False,
             "format": "json",
+            "think": self.settings.ollama_think,
             "options": {"temperature": 0.1},
         }
+        if self.settings.ollama_num_predict is not None:
+            payload["options"]["num_predict"] = self.settings.ollama_num_predict
+
         response = requests.post(
             f"{self.settings.ollama_base_url.rstrip('/')}/api/chat",
             json=payload,
@@ -55,7 +59,7 @@ class LocalProcessor:
         data: dict[str, Any] = response.json()
         content = data.get("message", {}).get("content") or data.get("response")
         if not content:
-            raise RuntimeError("Ollama não retornou conteúdo.")
+            raise RuntimeError(f"Ollama não retornou conteúdo. Resposta: {data}")
 
         try:
             note_payload = json.loads(content)
@@ -76,4 +80,3 @@ class LocalProcessor:
 
 def process_audio(audio_path: str | Path, settings: Settings | None = None) -> ProcessResponse:
     return LocalProcessor(settings=settings).process(Path(audio_path))
-

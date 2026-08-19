@@ -27,6 +27,20 @@ def _float(name: str, default: float) -> float:
     return float(value) if value else default
 
 
+def _optional_int(name: str) -> int | None:
+    value = os.getenv(name)
+    return int(value) if value else None
+
+
+def _ollama_think(name: str, default: str) -> bool | str:
+    value = os.getenv(name, default).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off", "disabled", "none"}:
+        return False
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     # Shared paths
@@ -57,6 +71,8 @@ class Settings:
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
     ollama_timeout_seconds: float = _float("OLLAMA_TIMEOUT_SECONDS", 300.0)
+    ollama_think: bool | str = _ollama_think("OLLAMA_THINK", "false")
+    ollama_num_predict: int | None = _optional_int("OLLAMA_NUM_PREDICT")
 
     # Cloud fallback
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")

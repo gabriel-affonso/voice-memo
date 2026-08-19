@@ -67,7 +67,10 @@ class NotionClient:
             json=payload,
             timeout=30,
         )
-        response.raise_for_status()
+        if not response.ok:
+            raise RuntimeError(
+                f"Notion create page falhou: HTTP {response.status_code} {response.text}"
+            )
         return response.json()["id"]
 
     def _parent(self) -> dict[str, str]:
