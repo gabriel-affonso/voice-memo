@@ -1,0 +1,16 @@
+[Unit]
+Description=VoiceMemo GPU Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/voice-memo
+EnvironmentFile=/opt/voice-memo/.env
+ExecStart=/opt/voice-memo/.venv/bin/python -m voice_memo.gpu_server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

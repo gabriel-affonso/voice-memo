@@ -1,0 +1,65 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from openai import OpenAI
+
+from voice_memo.config import Settings, get_settings
+from voice_memo.models.schemas import ProcessResponse, ProcessedNote
+from voice_memo.prompts import build_note_prompt
+
+
+class CloudProcessor:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or get_settings()
+        if not self.settings.openai_api_key:
+            raise RuntimeError("OPENAI_API_KEY não configurada para fallback cloud.")
+        self.client = OpenAI(
+            api_key=self.settings.openai_api_key,
+            timeout=self.settings.cloud_timeout_seconds,
+        )
+
+    def transcribe(self, audio_path: Path) -> str:
+        with audio_path.open("rb") as audio_file:
+            result = self.client.audio.transcriptions.create(
+                model=self.settings.cloud_stt_model,
+                file=audio_file,
+                language=self.settings.transcription_language,
+            )
+        transcript = getattr(result, "text", "").strip()
+        if not transcript:
+            raise RuntimeError("Transcrição cloud vazia.")
+        return transcript
+
+    def structure_note(self, transcript: str) -> ProcessedNote:
+        response = self.client.chat.completions.create(
+            model=self.settings.cloud_llm_model,
+            messages=build_note_prompt(transcript),
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise RuntimeError("LLM cloud não retornou conteúdo.")
+
+        try:
+            note_payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"LLM cloud retornou JSON inválido: {content[:500]}") from exc
+
+        return ProcessedNote.model_validate(note_payload)
+
+    def process(self, audio_path: Path) -> ProcessResponse:
+        transcript = self.transcribe(audio_path)
+        note = self.structure_note(transcript)
+        return ProcessResponse(
+            transcript=transcript,
+            note=note,
+            processor=f"cloud:openai:{self.settings.cloud_stt_model}+{self.settings.cloud_llm_model}",
+        )
+
+
+def process_audio_cloud(audio_path: str | Path, settings: Settings | None = None) -> ProcessResponse:
+    return CloudProcessor(settings=settings).process(Path(audio_path))
+
