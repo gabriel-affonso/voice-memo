@@ -42,7 +42,7 @@ class Settings:
     # GPU backend
     gpu_server_url: str = os.getenv("GPU_SERVER_URL", "http://127.0.0.1:8088")
     gpu_health_timeout_seconds: float = _float("GPU_HEALTH_TIMEOUT_SECONDS", 2.0)
-    gpu_process_timeout_seconds: float = _float("GPU_PROCESS_TIMEOUT_SECONDS", 180.0)
+    gpu_process_timeout_seconds: float = _float("GPU_PROCESS_TIMEOUT_SECONDS", 360.0)
 
     # Queue behavior
     poll_interval_seconds: float = _float("POLL_INTERVAL_SECONDS", 2.0)
@@ -56,7 +56,7 @@ class Settings:
     transcription_language: str = os.getenv("TRANSCRIPTION_LANGUAGE", "pt")
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
     ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
-    ollama_timeout_seconds: float = _float("OLLAMA_TIMEOUT_SECONDS", 120.0)
+    ollama_timeout_seconds: float = _float("OLLAMA_TIMEOUT_SECONDS", 300.0)
 
     # Cloud fallback
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")

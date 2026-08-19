@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
 from pathlib import Path
 
 from openai import OpenAI
@@ -28,12 +30,18 @@ class CloudProcessor:
             )
 
     def transcribe(self, audio_path: Path) -> str:
-        with audio_path.open("rb") as audio_file:
-            result = self.client.audio.transcriptions.create(
-                model=self.settings.cloud_stt_model,
-                file=audio_file,
-                language=self.settings.transcription_language,
-            )
+        upload_path = self._cloud_safe_audio_path(audio_path)
+        try:
+            with upload_path.open("rb") as audio_file:
+                result = self.client.audio.transcriptions.create(
+                    model=self.settings.cloud_stt_model,
+                    file=audio_file,
+                    language=self.settings.transcription_language,
+                )
+        finally:
+            if upload_path != audio_path:
+                upload_path.unlink(missing_ok=True)
+
         transcript = getattr(result, "text", "").strip()
         if not transcript:
             raise RuntimeError("Transcrição cloud vazia.")
@@ -80,6 +88,16 @@ class CloudProcessor:
             else f"openai:{self.settings.cloud_llm_model}"
         )
         return f"openai:{self.settings.cloud_stt_model}+{llm}"
+
+    def _cloud_safe_audio_path(self, audio_path: Path) -> Path:
+        if audio_path.suffix.lower() != ".oga":
+            return audio_path
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".ogg", delete=False)
+        tmp_path = Path(tmp.name)
+        with tmp, audio_path.open("rb") as source:
+            shutil.copyfileobj(source, tmp)
+        return tmp_path
 
 
 def process_audio_cloud(audio_path: str | Path, settings: Settings | None = None) -> ProcessResponse:
