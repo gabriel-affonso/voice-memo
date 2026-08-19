@@ -26,15 +26,34 @@ def test_notion() -> None:
     print(f"OK: página criada no Notion: {page_id}")
 
 
+def show_notion_schema() -> None:
+    settings = get_settings()
+    schema = NotionClient(settings).retrieve_schema()
+    properties = schema.get("properties", {})
+    if not properties:
+        print("Nenhuma propriedade encontrada na resposta do Notion.")
+        return
+
+    print("Propriedades do Notion:")
+    for name, definition in sorted(properties.items(), key=lambda item: item[0].lower()):
+        prop_type = definition.get("type", "unknown")
+        print(f"- {name} | {prop_type}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="VoiceMemo smoke tests")
-    parser.add_argument("target", choices=["notion"], help="Integração a testar")
+    parser.add_argument(
+        "target",
+        choices=["notion", "notion-schema"],
+        help="Integração a testar",
+    )
     args = parser.parse_args()
 
     if args.target == "notion":
         test_notion()
+    elif args.target == "notion-schema":
+        show_notion_schema()
 
 
 if __name__ == "__main__":
     main()
-

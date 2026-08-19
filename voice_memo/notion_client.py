@@ -78,6 +78,22 @@ class NotionClient:
             return {"data_source_id": self.settings.notion_data_source_id}
         return {"database_id": self.settings.notion_database_id}
 
+    def retrieve_schema(self) -> dict[str, Any]:
+        if self.settings.notion_data_source_id:
+            url = (
+                "https://api.notion.com/v1/data_sources/"
+                f"{self.settings.notion_data_source_id}"
+            )
+        else:
+            url = f"https://api.notion.com/v1/databases/{self.settings.notion_database_id}"
+
+        response = requests.get(url, headers=self.headers, timeout=30)
+        if not response.ok:
+            raise RuntimeError(
+                f"Notion schema fetch falhou: HTTP {response.status_code} {response.text}"
+            )
+        return response.json()
+
     def _rich_text(self, value: str) -> list[dict[str, Any]]:
         text = value.strip()
         if not text:
