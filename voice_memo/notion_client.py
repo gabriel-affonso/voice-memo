@@ -33,33 +33,59 @@ class NotionClient:
         properties: dict[str, Any] = {
             self.settings.notion_title_property: {
                 "title": [{"text": {"content": note.title[:2000]}}],
-            },
-            self.settings.notion_clean_note_property: {
-                "rich_text": self._rich_text(note.clean_note),
-            },
-            self.settings.notion_summary_property: {
-                "rich_text": self._rich_text(note.summary),
-            },
-            self.settings.notion_transcript_property: {
-                "rich_text": self._rich_text(transcript),
-            },
-            self.settings.notion_tasks_property: {
-                "rich_text": self._rich_text(self._format_tasks(note)),
-            },
-            self.settings.notion_tags_property: {
-                "multi_select": [{"name": tag} for tag in note.tags],
-            },
-            self.settings.notion_source_property: {
-                "rich_text": self._rich_text(source),
-            },
-            self.settings.notion_processor_property: {
-                "rich_text": self._rich_text(processor),
-            },
+            }
         }
+        self._add_rich_text_property(
+            properties,
+            self.settings.notion_clean_note_property,
+            note.clean_note,
+        )
+        self._add_rich_text_property(
+            properties,
+            self.settings.notion_summary_property,
+            note.summary,
+        )
+        self._add_rich_text_property(
+            properties,
+            self.settings.notion_transcript_property,
+            transcript,
+        )
+        self._add_rich_text_property(
+            properties,
+            self.settings.notion_tasks_property,
+            self._format_tasks(note),
+        )
+        self._add_multi_select_property(
+            properties,
+            self.settings.notion_tags_property,
+            note.tags,
+        )
+        self._add_rich_text_property(properties, self.settings.notion_source_property, source)
+        self._add_rich_text_property(
+            properties,
+            self.settings.notion_processor_property,
+            processor,
+        )
+        self._add_status_property(
+            properties,
+            self.settings.notion_status_property,
+            self.settings.notion_status_value,
+        )
+        self._add_select_property(
+            properties,
+            self.settings.notion_system_status_property,
+            self.settings.notion_system_status_value,
+        )
+        self._add_date_property(
+            properties,
+            self.settings.notion_created_property,
+            self.settings.notion_created_date,
+        )
 
         payload = {
             "parent": self._parent(),
             "properties": properties,
+            "children": self._children(note, transcript, source, processor),
         }
         response = requests.post(
             "https://api.notion.com/v1/pages",
@@ -93,6 +119,87 @@ class NotionClient:
                 f"Notion schema fetch falhou: HTTP {response.status_code} {response.text}"
             )
         return response.json()
+
+    def _add_rich_text_property(
+        self,
+        properties: dict[str, Any],
+        name: str,
+        value: str,
+    ) -> None:
+        if name:
+            properties[name] = {"rich_text": self._rich_text(value)}
+
+    def _add_multi_select_property(
+        self,
+        properties: dict[str, Any],
+        name: str,
+        values: list[str],
+    ) -> None:
+        if name:
+            properties[name] = {"multi_select": [{"name": value} for value in values]}
+
+    def _add_select_property(
+        self,
+        properties: dict[str, Any],
+        name: str,
+        value: str,
+    ) -> None:
+        if name and value:
+            properties[name] = {"select": {"name": value}}
+
+    def _add_status_property(
+        self,
+        properties: dict[str, Any],
+        name: str,
+        value: str,
+    ) -> None:
+        if name and value:
+            properties[name] = {"status": {"name": value}}
+
+    def _add_date_property(
+        self,
+        properties: dict[str, Any],
+        name: str,
+        value: str,
+    ) -> None:
+        if name and value:
+            properties[name] = {"date": {"start": value}}
+
+    def _children(
+        self,
+        note: ProcessedNote,
+        transcript: str,
+        source: str,
+        processor: str,
+    ) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+        self._append_section(blocks, "Resumo", note.summary)
+        self._append_section(blocks, "Nota", note.clean_note)
+        self._append_section(blocks, "Tarefas", self._format_tasks(note))
+        self._append_section(blocks, "Transcrição", transcript)
+        self._append_section(blocks, "Metadados", f"Source: {source}\nProcessor: {processor}")
+        return blocks
+
+    def _append_section(self, blocks: list[dict[str, Any]], heading: str, text: str) -> None:
+        value = text.strip()
+        if not value:
+            return
+
+        blocks.append(
+            {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": self._rich_text(heading)},
+            }
+        )
+        for chunk in self._chunks(value, 1900):
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": self._rich_text(chunk)},
+                }
+            )
 
     def _rich_text(self, value: str) -> list[dict[str, Any]]:
         text = value.strip()

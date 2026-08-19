@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -39,6 +40,10 @@ def _ollama_think(name: str, default: str) -> bool | str:
     if value in {"0", "false", "no", "n", "off", "disabled", "none"}:
         return False
     return value
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
 
 
 @dataclass(frozen=True)
@@ -92,14 +97,20 @@ class Settings:
     )
     notion_database_id: str = os.getenv("NOTION_DATABASE_ID", "")
     notion_api_version: str = os.getenv("NOTION_API_VERSION", "2026-03-11")
-    notion_title_property: str = os.getenv("NOTION_TITLE_PROPERTY", "Name")
-    notion_clean_note_property: str = os.getenv("NOTION_CLEAN_NOTE_PROPERTY", "Clean Note")
-    notion_summary_property: str = os.getenv("NOTION_SUMMARY_PROPERTY", "Summary")
-    notion_transcript_property: str = os.getenv("NOTION_TRANSCRIPT_PROPERTY", "Transcript")
-    notion_tasks_property: str = os.getenv("NOTION_TASKS_PROPERTY", "Tasks")
-    notion_tags_property: str = os.getenv("NOTION_TAGS_PROPERTY", "Tags")
-    notion_source_property: str = os.getenv("NOTION_SOURCE_PROPERTY", "Source")
-    notion_processor_property: str = os.getenv("NOTION_PROCESSOR_PROPERTY", "Processor")
+    notion_title_property: str = _env("NOTION_TITLE_PROPERTY", "Name")
+    notion_clean_note_property: str = _env("NOTION_CLEAN_NOTE_PROPERTY")
+    notion_summary_property: str = _env("NOTION_SUMMARY_PROPERTY")
+    notion_transcript_property: str = _env("NOTION_TRANSCRIPT_PROPERTY")
+    notion_tasks_property: str = _env("NOTION_TASKS_PROPERTY")
+    notion_tags_property: str = _env("NOTION_TAGS_PROPERTY", "Tags")
+    notion_source_property: str = _env("NOTION_SOURCE_PROPERTY")
+    notion_processor_property: str = _env("NOTION_PROCESSOR_PROPERTY")
+    notion_status_property: str = _env("NOTION_STATUS_PROPERTY")
+    notion_status_value: str = _env("NOTION_STATUS_VALUE")
+    notion_system_status_property: str = _env("NOTION_SYSTEM_STATUS_PROPERTY")
+    notion_system_status_value: str = _env("NOTION_SYSTEM_STATUS_VALUE")
+    notion_created_property: str = _env("NOTION_CREATED_PROPERTY")
+    notion_created_date: str = _env("NOTION_CREATED_DATE", date.today().isoformat())
 
     # Server
     gpu_host: str = os.getenv("GPU_HOST", "0.0.0.0")

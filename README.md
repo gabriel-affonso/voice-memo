@@ -103,14 +103,16 @@ Ajuste também os nomes das propriedades do Notion se o seu database usa outros 
 
 ```bash
 NOTION_TITLE_PROPERTY=Name
-NOTION_CLEAN_NOTE_PROPERTY=Clean Note
-NOTION_SUMMARY_PROPERTY=Summary
-NOTION_TRANSCRIPT_PROPERTY=Transcript
-NOTION_TASKS_PROPERTY=Tasks
+NOTION_CLEAN_NOTE_PROPERTY=
+NOTION_SUMMARY_PROPERTY=
+NOTION_TRANSCRIPT_PROPERTY=
+NOTION_TASKS_PROPERTY=
 NOTION_TAGS_PROPERTY=Tags
-NOTION_SOURCE_PROPERTY=Source
-NOTION_PROCESSOR_PROPERTY=Processor
+NOTION_SOURCE_PROPERTY=
+NOTION_PROCESSOR_PROPERTY=
 ```
+
+Se uma propriedade estiver vazia, o VoiceMemo não tenta escrever nela. O conteúdo completo da nota, resumo, tarefas, transcrição e metadados é salvo como blocos no corpo da página.
 
 Rode:
 
