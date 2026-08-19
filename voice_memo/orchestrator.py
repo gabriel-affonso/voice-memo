@@ -72,9 +72,15 @@ class VoiceMemoOrchestrator:
         while True:
             try:
                 self.poll_telegram_once()
+            except requests.RequestException as exc:
+                LOGGER.warning("Falha temporária ao consultar Telegram: %s", exc)
+            except Exception:
+                LOGGER.exception("Erro inesperado ao consultar Telegram.")
+
+            try:
                 self.process_ready_jobs_once()
             except Exception:
-                LOGGER.exception("Erro no loop principal.")
+                LOGGER.exception("Erro ao processar fila.")
                 time.sleep(self.settings.poll_interval_seconds)
 
     def poll_telegram_once(self) -> None:
@@ -139,6 +145,7 @@ class VoiceMemoOrchestrator:
                 processor=result.processor,
             )
             self.db.mark_done(job.id, result=result, notion_page_id=page_id)
+            LOGGER.info("Job %s salvo no Notion: %s.", job.id, page_id)
         except Exception as exc:
             LOGGER.exception("Job %s falhou.", job.id)
             self.db.mark_failed(job.id, str(exc))
