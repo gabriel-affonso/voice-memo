@@ -2,15 +2,14 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-
-if [ -f .env ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
-fi
-
 source .venv/bin/activate
+
+EXTRA_CUDA_LIB_PATH="$(python - <<'PY'
+from dotenv import dotenv_values
+
+print(dotenv_values(".env").get("EXTRA_LD_LIBRARY_PATH", "") or "")
+PY
+)"
 
 CUDA_LIB_PATH="$(python - <<'PY'
 import os
@@ -33,8 +32,8 @@ if [ -n "${CUDA_LIB_PATH}" ]; then
   export LD_LIBRARY_PATH="${CUDA_LIB_PATH}:${LD_LIBRARY_PATH:-}"
 fi
 
-if [ -n "${EXTRA_LD_LIBRARY_PATH:-}" ]; then
-  export LD_LIBRARY_PATH="${EXTRA_LD_LIBRARY_PATH}:${LD_LIBRARY_PATH:-}"
+if [ -n "${EXTRA_CUDA_LIB_PATH}" ]; then
+  export LD_LIBRARY_PATH="${EXTRA_CUDA_LIB_PATH}:${LD_LIBRARY_PATH:-}"
 fi
 
 python -m voice_memo.gpu_server
