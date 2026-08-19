@@ -8,7 +8,7 @@ Telegram -> NUC -> SQLite queue -> GPU /process -> Notion -> Telegram
                          +-> fallback cloud quando GPU cai
 ```
 
-O NUC fica sempre ligado e mantém a fila. O servidor GPU vira um backend opcional de inferência local com `GET /health` e `POST /process`. Se a GPU estiver fora do ar, lenta ou com erro, o NUC usa cloud para transcrição e LLM, validando o mesmo schema `ProcessedNote`.
+O NUC fica sempre ligado e mantém a fila. O servidor GPU vira um backend opcional de inferência local com `GET /health` e `POST /process`. Se a GPU estiver fora do ar, lenta ou com erro, o NUC usa cloud para transcrição e LLM, validando o mesmo schema `ProcessedNote`. Por padrão, o fallback cloud usa OpenAI para transcrever o áudio e DeepSeek para estruturar a nota.
 
 ## Estrutura
 
@@ -94,8 +94,9 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ALLOWED_CHAT_IDS=
 GPU_SERVER_URL=http://GPU_SERVER_IP:8088
 OPENAI_API_KEY=...
+DEEPSEEK_API_KEY=...
 NOTION_TOKEN=...
-NOTION_DATABASE_ID=...
+NOTION_DATA_SOURCE_ID=...
 ```
 
 Ajuste também os nomes das propriedades do Notion se o seu database usa outros nomes:
@@ -149,4 +150,3 @@ Logs:
 journalctl -u voice-memo-nuc -f
 journalctl -u voice-memo-gpu -f
 ```
-

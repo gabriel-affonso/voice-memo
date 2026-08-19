@@ -13,8 +13,8 @@ class NotionClient:
         self.settings = settings or get_settings()
         if not self.settings.notion_token:
             raise RuntimeError("NOTION_TOKEN não configurado.")
-        if not self.settings.notion_database_id:
-            raise RuntimeError("NOTION_DATABASE_ID não configurado.")
+        if not self.settings.notion_data_source_id and not self.settings.notion_database_id:
+            raise RuntimeError("NOTION_DATA_SOURCE_ID não configurado.")
 
         self.headers = {
             "Authorization": f"Bearer {self.settings.notion_token}",
@@ -58,7 +58,7 @@ class NotionClient:
         }
 
         payload = {
-            "parent": {"database_id": self.settings.notion_database_id},
+            "parent": self._parent(),
             "properties": properties,
         }
         response = requests.post(
@@ -69,6 +69,11 @@ class NotionClient:
         )
         response.raise_for_status()
         return response.json()["id"]
+
+    def _parent(self) -> dict[str, str]:
+        if self.settings.notion_data_source_id:
+            return {"data_source_id": self.settings.notion_data_source_id}
+        return {"database_id": self.settings.notion_database_id}
 
     def _rich_text(self, value: str) -> list[dict[str, Any]]:
         text = value.strip()
@@ -87,4 +92,3 @@ class NotionClient:
             due = f" | {task.due}" if task.due else ""
             lines.append(f"- {task.text}{due}")
         return "\n".join(lines)
-

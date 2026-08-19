@@ -60,14 +60,22 @@ class Settings:
 
     # Cloud fallback
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    cloud_stt_model: str = os.getenv("CLOUD_STT_MODEL", "whisper-1")
+    cloud_stt_model: str = os.getenv("CLOUD_STT_MODEL", "gpt-4o-mini-transcribe")
     cloud_llm_model: str = os.getenv("CLOUD_LLM_MODEL", "gpt-4o-mini")
     cloud_timeout_seconds: float = _float("CLOUD_TIMEOUT_SECONDS", 180.0)
+    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY", "")
+    deepseek_base_url: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    deepseek_model: str = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    deepseek_thinking: str = os.getenv("DEEPSEEK_THINKING", "disabled")
 
     # Notion
     notion_token: str = os.getenv("NOTION_TOKEN", "")
+    notion_data_source_id: str = os.getenv(
+        "NOTION_DATA_SOURCE_ID",
+        os.getenv("NOTION_DATASOURCE_ID", ""),
+    )
     notion_database_id: str = os.getenv("NOTION_DATABASE_ID", "")
-    notion_api_version: str = os.getenv("NOTION_API_VERSION", "2022-06-28")
+    notion_api_version: str = os.getenv("NOTION_API_VERSION", "2026-03-11")
     notion_title_property: str = os.getenv("NOTION_TITLE_PROPERTY", "Name")
     notion_clean_note_property: str = os.getenv("NOTION_CLEAN_NOTE_PROPERTY", "Clean Note")
     notion_summary_property: str = os.getenv("NOTION_SUMMARY_PROPERTY", "Summary")
@@ -97,7 +105,7 @@ class Settings:
 
     @property
     def notion_enabled(self) -> bool:
-        return bool(self.notion_token and self.notion_database_id)
+        return bool(self.notion_token and (self.notion_data_source_id or self.notion_database_id))
 
     @property
     def cloud_enabled(self) -> bool:
@@ -106,4 +114,3 @@ class Settings:
 
 def get_settings() -> Settings:
     return Settings()
-

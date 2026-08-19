@@ -19,6 +19,13 @@ class CloudProcessor:
             api_key=self.settings.openai_api_key,
             timeout=self.settings.cloud_timeout_seconds,
         )
+        self.deepseek_client = None
+        if self.settings.deepseek_api_key:
+            self.deepseek_client = OpenAI(
+                api_key=self.settings.deepseek_api_key,
+                base_url=self.settings.deepseek_base_url,
+                timeout=self.settings.cloud_timeout_seconds,
+            )
 
     def transcribe(self, audio_path: Path) -> str:
         with audio_path.open("rb") as audio_file:
@@ -33,11 +40,18 @@ class CloudProcessor:
         return transcript
 
     def structure_note(self, transcript: str) -> ProcessedNote:
-        response = self.client.chat.completions.create(
-            model=self.settings.cloud_llm_model,
+        client = self.deepseek_client or self.client
+        model = self.settings.deepseek_model if self.deepseek_client else self.settings.cloud_llm_model
+        kwargs = {}
+        if self.deepseek_client:
+            kwargs["extra_body"] = {"thinking": {"type": self.settings.deepseek_thinking}}
+
+        response = client.chat.completions.create(
+            model=model,
             messages=build_note_prompt(transcript),
             response_format={"type": "json_object"},
             temperature=0.1,
+            **kwargs,
         )
         content = response.choices[0].message.content
         if not content:
@@ -56,10 +70,17 @@ class CloudProcessor:
         return ProcessResponse(
             transcript=transcript,
             note=note,
-            processor=f"cloud:openai:{self.settings.cloud_stt_model}+{self.settings.cloud_llm_model}",
+            processor=f"cloud:{self._processor_name()}",
         )
+
+    def _processor_name(self) -> str:
+        llm = (
+            f"deepseek:{self.settings.deepseek_model}"
+            if self.deepseek_client
+            else f"openai:{self.settings.cloud_llm_model}"
+        )
+        return f"openai:{self.settings.cloud_stt_model}+{llm}"
 
 
 def process_audio_cloud(audio_path: str | Path, settings: Settings | None = None) -> ProcessResponse:
     return CloudProcessor(settings=settings).process(Path(audio_path))
-
