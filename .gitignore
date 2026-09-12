@@ -7,3 +7,16 @@ __pycache__/
 data/
 audio/inbox/
 
+
+# Local secret backups
+/.env.*
+/.env.save
+
+# ESP32 local secrets
+firmware/**/secrets.h
+firmware/**/secrets.cpp
+firmware/**/config_local.h
+
+# PlatformIO
+.pio/
+firmware/**/.pio/
