@@ -1,0 +1,17 @@
+# Local-only secrets. Never commit real Wi-Fi credentials, ingest tokens,
+# device ids or LAN addresses. Only secrets.example.h belongs in the repo.
+secrets.h
+secrets*.h
+!secrets.example.h
+
+# Editor / OS noise
+.DS_Store
+*.bak
+*.orig
+*~
+
+# Local Arduino build output
+build/
+*.elf
+*.bin
+*.map
