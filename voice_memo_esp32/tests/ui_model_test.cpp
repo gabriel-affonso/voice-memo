@@ -174,6 +174,8 @@ int main(int argc, char** argv) {
     checkScreen("Recording + no Wi-Fi", modelFor(AppState::Recording, false), UiScreen::Recording);
     checkScreen("MaxReachedWaitingRelease",
                 modelFor(AppState::MaxReachedWaitingRelease, true), UiScreen::MaxReached);
+    checkScreen("Saving (persisting to microSD)", modelFor(AppState::Saving, true), UiScreen::Saving);
+    checkScreen("Saving + no Wi-Fi", modelFor(AppState::Saving, false), UiScreen::Saving);
     checkScreen("Uploading", modelFor(AppState::Uploading, true), UiScreen::Uploading);
     checkScreen("RetryWait", modelFor(AppState::RetryWait, false), UiScreen::RetryWait);
 
@@ -201,6 +203,11 @@ int main(int argc, char** argv) {
         model.sent_visible = true;
         checkScreen("SENT overlay does not mask RetryWait", model, UiScreen::RetryWait);
     }
+    {
+        UiModel model = modelFor(AppState::Saving, true);
+        model.sent_visible = true;
+        checkScreen("SENT overlay does not mask Saving", model, UiScreen::Saving);
+    }
 
     // ---------------------------------------------------------------------
     section("case 3: only Idle may change the tag");
@@ -209,6 +216,8 @@ int main(int argc, char** argv) {
               ui_tag_selection_allowed(AppState::Recording), false);
     checkBool("tag selection refused in MaxReachedWaitingRelease",
               ui_tag_selection_allowed(AppState::MaxReachedWaitingRelease), false);
+    checkBool("tag selection refused in Saving",
+              ui_tag_selection_allowed(AppState::Saving), false);
     checkBool("tag selection refused in Uploading",
               ui_tag_selection_allowed(AppState::Uploading), false);
     checkBool("tag selection refused in RetryWait",
@@ -324,6 +333,8 @@ int main(int argc, char** argv) {
                  UiRefresh::Full);
     checkRefresh("Recording + screen change -> partial (audio never stalls)",
                  refreshFor(true, false, AppState::Recording, 0), UiRefresh::Partial);
+    checkRefresh("Saving + screen change -> partial (commit must not be delayed)",
+                 refreshFor(true, false, AppState::Saving, 0), UiRefresh::Partial);
     checkRefresh("Uploading + screen change -> partial (BOOT stays responsive)",
                  refreshFor(true, false, AppState::Uploading, 0), UiRefresh::Partial);
     checkRefresh("RetryWait + screen change -> partial",
@@ -337,6 +348,8 @@ int main(int argc, char** argv) {
     checkBool("blocking is only allowed while Idle", ui_refresh_can_block(AppState::Idle), true);
     checkBool("blocking is refused while Recording",
               ui_refresh_can_block(AppState::Recording), false);
+    checkBool("blocking is refused while Saving",
+              ui_refresh_can_block(AppState::Saving), false);
     checkBool("blocking is refused while Uploading",
               ui_refresh_can_block(AppState::Uploading), false);
 
@@ -421,7 +434,7 @@ int main(int argc, char** argv) {
             const char* name;
             UiView view;
         };
-        Case cases[7];
+        Case cases[14];
         cases[0].name = "READY";
         cases[0].view.screen = UiScreen::Ready;
         cases[0].view.tag = VoiceTag::Idea;
@@ -460,6 +473,43 @@ int main(int argc, char** argv) {
         cases[6].name = "SENT";
         cases[6].view = cases[4].view;
         cases[6].view.screen = UiScreen::Sent;
+
+        cases[7].name = "SAVING";
+        cases[7].view = cases[4].view;
+        cases[7].view.screen = UiScreen::Saving;
+        cases[7].view.tag = VoiceTag::Idea;
+
+        cases[8].name = "READY + 3 pending";
+        cases[8].view = cases[0].view;
+        cases[8].view.sd_available = true;
+        cases[8].view.pending_count = 3;
+
+        cases[9].name = "READY + SD FULL";
+        cases[9].view = cases[8].view;
+        cases[9].view.storage_full = true;
+        cases[9].view.pending_count = 0;
+
+        cases[10].name = "READY + SD ERROR (no card)";
+        cases[10].view = cases[8].view;
+        cases[10].view.sd_available = false;
+        cases[10].view.sd_error = true;
+        cases[10].view.pending_count = 0;
+
+        // The power screens. POWERED OFF is the last image the panel is ever
+        // given, so it must be complete and unclipped; the two notices are the
+        // only feedback a refused shutdown produces.
+        cases[11].name = "POWERED OFF";
+        cases[11].view = cases[0].view;
+        cases[11].view.screen = UiScreen::PowerOff;
+        cases[11].view.power_off_pending = 5;
+
+        cases[12].name = "RECORDING + STOP RECORDING FIRST";
+        cases[12].view = cases[2].view;
+        cases[12].view.stop_recording_hint = true;
+
+        cases[13].name = "UNSENT NOTE";
+        cases[13].view = cases[5].view;
+        cases[13].view.unsent_note_hint = true;
 
         for (const Case& item : cases) {
             renderInto(canvas, item.view);
@@ -501,6 +551,62 @@ int main(int argc, char** argv) {
         busy.busy_hint = true;
         renderInto(canvas, busy);
         checkBool("BUSY hint renders inside the panel", nothingClipped(canvas, 3), true);
+
+        // The storage status line is the only place the persistent queue is
+        // visible on the panel. It must be painted when there is something to
+        // say and stay silent when the queue is empty and the card is healthy.
+        const auto bandInk = [&canvas](const UiView& view, int y0, int y1) {
+            renderInto(canvas, view);
+            int ink = 0;
+            for (int y = y0; y < y1; ++y) {
+                for (int x = 0; x < kScreenWidth; ++x) {
+                    if (canvas.pixelAt(x, y) == GfxColor::Black) {
+                        ++ink;
+                    }
+                }
+            }
+            return ink;
+        };
+
+        UiView quiet = cases[0].view;
+        quiet.sd_available = true;
+        quiet.pending_count = 0;
+        checkBool("storage line appears with pending notes",
+                  bandInk(cases[8].view, 70, 82) > 0, true);
+        checkBool("storage line is silent with an empty queue",
+                  bandInk(quiet, 70, 82) == 0, true);
+        checkBool("storage line shows SD FULL", bandInk(cases[9].view, 70, 82) > 0, true);
+        checkBool("storage line shows SD ERROR", bandInk(cases[10].view, 70, 82) > 0, true);
+        checkBool("SAVING screen is painted", bandInk(cases[7].view, 30, 120) > 0, true);
+
+        // POWERED OFF must not freeze a stale clock, battery percentage or Wi-Fi
+        // icon onto the glass: the panel keeps this image with the MCU off, so a
+        // frozen "--:--" would be a permanent lie. The top bar is therefore
+        // absent, which is checked as "the top bar band is blank".
+        {
+            renderInto(canvas, cases[11].view);
+            int topBarInk = 0;
+            for (int y = 0; y < static_cast<int>(kTopBarRuleY) + 1; ++y) {
+                for (int x = 0; x < kScreenWidth; ++x) {
+                    if (canvas.pixelAt(x, y) == GfxColor::Black) {
+                        ++topBarInk;
+                    }
+                }
+            }
+            checkBool("POWERED OFF carries no live top bar", topBarInk == 0, true);
+            checkBool("POWERED OFF states that queued notes survive",
+                      bandInk(cases[11].view, 128, 142) > 0, true);
+            UiView noPending = cases[11].view;
+            noPending.power_off_pending = 0;
+            checkBool("POWERED OFF stays quiet when nothing is queued",
+                      bandInk(noPending, 128, 142) == 0, true);
+            // The two notices must be visible where they are painted.
+            checkBool("STOP RECORDING FIRST paints its warning band",
+                      bandInk(cases[12].view, 96, 130) > 0, true);
+            checkBool("UNSENT NOTE paints a full body",
+                      bandInk(cases[13].view, 40, 140) > 0, true);
+        }
+
     }
 
     // ---------------------------------------------------------------------
@@ -589,6 +695,25 @@ int main(int argc, char** argv) {
         view.screen = UiScreen::MaxReached;
         view.elapsed_ms = 45000;
         dumpScreen("MAX 45s", view);
+        view.screen = UiScreen::Saving;
+        view.tag = VoiceTag::Idea;
+        dumpScreen("SAVING", view);
+        view.screen = UiScreen::Ready;
+        view.tag = VoiceTag::Idea;
+        view.sd_available = true;
+        view.pending_count = 3;
+        view.background_upload = true;
+        dumpScreen("READY + 3 pending (uploading)", view);
+        view.storage_full = true;
+        view.pending_count = 0;
+        view.background_upload = false;
+        dumpScreen("READY + SD FULL", view);
+        view.storage_full = false;
+        view.sd_available = false;
+        view.sd_error = true;
+        dumpScreen("READY + SD ERROR", view);
+        view.sd_error = false;
+        view.sd_available = true;
         view.screen = UiScreen::Uploading;
         view.tag = VoiceTag::Work;
         view.elapsed_ms = 7000;

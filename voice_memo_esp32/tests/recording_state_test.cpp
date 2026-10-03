@@ -47,6 +47,25 @@ void section(const char* title) {
     std::printf("\n--- %s\n", title);
 }
 
+void checkAction(
+    const char* label,
+    voice_memo_firmware::ButtonAction actual,
+    voice_memo_firmware::ButtonAction expected
+) {
+    const char* names[] = {"None", "StartRecording", "StopRecording"};
+    const unsigned int actualIndex = static_cast<unsigned int>(actual);
+    const unsigned int expectedIndex = static_cast<unsigned int>(expected);
+    if (actual == expected) {
+        std::printf("PASS %s -> %s\n", label, names[actualIndex]);
+        return;
+    }
+    std::printf("FAIL %s: expected %s, got %s\n",
+                label,
+                names[expectedIndex],
+                names[actualIndex]);
+    ++g_failures;
+}
+
 }  // namespace
 
 int main() {
@@ -155,8 +174,86 @@ int main() {
         false
     );
 
-    // Extra guards around the paths that used to block the main loop.
-    section("extra: max duration, Wi-Fi down and TEST A");
+    // Case 9: the persistent path freezes the buffer only while the SD commit
+    // runs, then hands ownership to the card and returns to Idle.
+    section("case 9: Saving -> committed -> Idle");
+    checkBool(
+        "buffer_is_frozen(Saving)",
+        voice_memo_firmware::buffer_is_frozen(AppState::Saving),
+        true
+    );
+    checkBool(
+        "allows_new_recording(Saving)",
+        voice_memo_firmware::allows_new_recording(AppState::Saving),
+        false
+    );
+    checkBool(
+        "state_after_boot_press(Saving) stays Saving",
+        voice_memo_firmware::state_after_boot_press(AppState::Saving) == AppState::Saving,
+        true
+    );
+    checkState(
+        "state_after_persist_ok()",
+        voice_memo_firmware::state_after_persist_ok(),
+        AppState::Idle
+    );
+    checkBool(
+        "allows_new_recording(Idle) after a commit",
+        voice_memo_firmware::allows_new_recording(voice_memo_firmware::state_after_persist_ok()),
+        true
+    );
+
+    // Toggle-to-record. This is the whole button rule the recorder executes
+    // (RecordingApp::tickIdle/tickRecording): one press starts from Idle, a
+    // second press finalizes, and the *release* is never an action - which is
+    // what keeps the capture running with the finger lifted AND what stops the
+    // release of the starting press from being read as a stop.
+    section("toggle: Idle -> start, Recording -> stop, everything else refused");
+    checkAction(
+        "Idle + press",
+        voice_memo_firmware::button_action_for_state(AppState::Idle),
+        voice_memo_firmware::ButtonAction::StartRecording
+    );
+    checkAction(
+        "Recording + press",
+        voice_memo_firmware::button_action_for_state(AppState::Recording),
+        voice_memo_firmware::ButtonAction::StopRecording
+    );
+    checkAction(
+        "Saving + press is refused (the PSRAM copy is the only one)",
+        voice_memo_firmware::button_action_for_state(AppState::Saving),
+        voice_memo_firmware::ButtonAction::None
+    );
+    checkAction(
+        "Uploading + press is refused (the upload owns the WAV)",
+        voice_memo_firmware::button_action_for_state(AppState::Uploading),
+        voice_memo_firmware::ButtonAction::None
+    );
+    checkAction(
+        "RetryWait + press is refused (the WAV must survive for the retry)",
+        voice_memo_firmware::button_action_for_state(AppState::RetryWait),
+        voice_memo_firmware::ButtonAction::None
+    );
+    checkAction(
+        "MaxReachedWaitingRelease + press is refused",
+        voice_memo_firmware::button_action_for_state(AppState::MaxReachedWaitingRelease),
+        voice_memo_firmware::ButtonAction::None
+    );
+    checkBool(
+        "the start press leaves the machine in Recording, never Idle",
+        voice_memo_firmware::button_action_for_state(AppState::Idle)
+                == voice_memo_firmware::ButtonAction::StartRecording &&
+            voice_memo_firmware::state_after_boot_press(AppState::Idle) == AppState::Recording,
+        true
+    );
+
+    // Extra guards around the paths that used to block the main loop. Note that
+    // the timeout no longer routes through state_after_max_duration(): it calls
+    // stopRecordingAndFinalize(StopReason::Timeout) and goes straight to the
+    // store/upload pipeline. The transition is pinned below only because
+    // MaxReachedWaitingRelease is still named by the UI model and the power
+    // policy.
+    section("extra: legacy max-duration state, Wi-Fi down and TEST A");
     checkState(
         "state_after_max_duration()",
         voice_memo_firmware::state_after_max_duration(),
@@ -199,6 +296,12 @@ int main() {
         "app_state_name(Uploading) not empty",
         voice_memo_firmware::app_state_name(AppState::Uploading) != nullptr
             && voice_memo_firmware::app_state_name(AppState::Uploading)[0] != '\0',
+        true
+    );
+    checkBool(
+        "app_state_name(Saving) not empty",
+        voice_memo_firmware::app_state_name(AppState::Saving) != nullptr
+            && voice_memo_firmware::app_state_name(AppState::Saving)[0] != '\0',
         true
     );
 

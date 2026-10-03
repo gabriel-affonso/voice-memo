@@ -13,7 +13,12 @@ ESP32-S3 Dev Module
 ```
 
 This is the real-hardware microphone validation firmware. It uses the same
-ESP32 -> ES8311 -> NUC audio path as the server project.
+ESP32 -> ES8311 -> NUC audio path as the server project. Since `v0.5.0` it also
+turns the board's microSD slot into a persistent queue: a finalized recording is
+committed to the card before the PSRAM buffer is reused, so a Wi-Fi loss, a
+reboot or a failed upload cannot lose it, and new notes can be recorded while
+older ones are still waiting to be sent. See
+[microSD persistence and the offline queue](#microsd-persistence-and-the-offline-queue-v050).
 
 ## Hardware version: this Touch model has only one
 
@@ -194,12 +199,23 @@ threshold. If the peak is near zero, the firmware prints:
 ```
 
 TEST A has no Wi-Fi or NUC dependency. With `VM_ENABLE_UPLOAD 0` the firmware
-never calls `WiFi.begin()`, never contacts the ingress, and a successful
-recording ends with:
+never calls `WiFi.begin()` and never contacts the ingress. What happens to the
+WAV after the serial summary depends on the card:
 
 ```text
+# card present (v0.5.0 default): persisted, and nothing is uploaded
+[store] saving id=... bytes=...
+[store] committed id=... bytes=... crc=...
+[queue] pending=1
+
+# no card: the pre-microSD behaviour, the WAV is dropped
 [app] TEST_A upload disabled; recording retained only for serial summary
 ```
+
+Because TEST A never uploads, a card left in the board accumulates pending notes
+until `VM_SD_MAX_PENDING` refuses more. That is intentional (nothing is deleted
+silently), but set `VM_ENABLE_SD 0` for a pure microphone bring-up, or clear
+`/voice_memo/pending` on a computer afterwards.
 
 Wi-Fi credentials and `INGEST_URL` may stay empty or unset for TEST A.
 
@@ -224,13 +240,35 @@ Use `--build-path` inside a writable directory so the Arduino cache is not
 touched. The same sketch also compiles with `PartitionScheme=default` (4 MB
 layout); it fits, but with much less headroom.
 
-Measured sizes with arduino-cli 1.5.1 and core 3.3.11:
+Measured sizes with arduino-cli 1.5.1 and core 3.3.11 (v0.6.0, Frank included):
 
 | Build | Flash | Static RAM |
 | --- | --- | --- |
-| `VM_ENABLE_UPLOAD 1`, `VM_ENABLE_UI 1` | 1 003 311 B (30%) | 48 760 B (14%) |
-| `VM_ENABLE_UPLOAD 0`, `VM_ENABLE_UI 1` (TEST A) | 525 172 B (15%) | 32 736 B (9%) |
-| `VM_ENABLE_UPLOAD 1`, `VM_ENABLE_UI 0` (pre-UI) | 944 831 B (28%) | 48 108 B (14%) |
+| `VM_ENABLE_UPLOAD 1`, `VM_ENABLE_UI 1`, `VM_ENABLE_SD 1` (default) | 1 164 439 B (34%) | 50 624 B (15%) |
+| `VM_ENABLE_UPLOAD 1`, `VM_ENABLE_UI 1`, `VM_ENABLE_SD 0` | 1 067 927 B (31%) | 49 128 B (14%) |
+| `VM_ENABLE_UPLOAD 1`, `VM_ENABLE_UI 0`, `VM_ENABLE_SD 1` | 1 070 855 B (32%) | 50 076 B (15%) |
+| `VM_ENABLE_UPLOAD 0`, `VM_ENABLE_UI 1`, `VM_ENABLE_SD 1` | 678 556 B (20%) | 34 584 B (10%) |
+| `VM_ENABLE_UPLOAD 0`, `VM_ENABLE_UI 1`, `VM_ENABLE_SD 0` (TEST A) | 587 268 B (17%) | 33 104 B (10%) |
+
+Every row is measured with `--warnings all` and zero warnings.
+
+The Frank asset pack (v0.6.0) is 44 992 B of `const` data - eight 200x200 frames at
+5000 B plus eight 96x52 overlays at 624 B - plus ~1 KB of code, so it adds about
+45 KB of flash (~1.4%) and **no** static RAM: the frames are read from flash in
+place and the only framebuffer stays the driver's 5000-byte one. Note the
+`VM_ENABLE_UI 0` row: with the UI switched off nothing references the face module,
+so `--gc-sections` discards the whole pack and the feature costs nothing there.
+Earlier v0.5.0 numbers were 1 118 647 / 1 020 963 / 1 072 055 / 632 748 / 540 264 B
+for the same five rows.
+
+The v0.5.0 power management feature added about 15 KB of
+flash (~1.4%) and ~230 B of static RAM over the microSD-only build: one debounced
+key, one activity timer, the inhibit policy and three extra screens.
+
+The microSD feature adds ~97 KB of flash over v0.4.1 (almost all of it the
+SDMMC + FAT VFS driver) and ~1.6 KB of static RAM. The background worker's stack
+grew from 8 KB to 12 KB to cover the 4 KB streaming chunk; the WAV itself is
+never copied onto it.
 
 ## Audio capture: the I2S RX slot is pinned to LEFT
 
@@ -374,45 +412,85 @@ verbatim (`02_Example/Arduino/07_BATT_PWR_Test/{user_config.h,src/power/board_po
 
 | Method | Role |
 | --- | --- |
-| `keepBatteryPowerOn()` | configures `GPIO17` as an output and drives it HIGH; idempotent and safe before `Serial.begin()` |
-| `begin()` | re-asserts the latch and prints the two `[power]` lines, once |
-| `powerOff()` | drives `GPIO17` LOW; intentionally never called (no deep sleep yet) |
+| `keepBatteryPowerOn()` | **the battery boot critical path**: drops a stale RTC pad hold on `GPIO17`, configures it as an output and drives it HIGH. First statement of `setup()`; no logging, no `delay()`, no bus access |
+| `releaseSleepPadsIfNeeded()` | hands `GPIO18` back from the RTC wake pad to the digital GPIO matrix and reports whether this reset was a deep-sleep wake. Runs immediately after the latch, before `Serial.begin()` |
+| `begin()` | re-asserts the latch and prints the one-shot `[power]` lines |
+| `powerOff()` | drives `GPIO17` LOW, holds it LOW through sleep, arms the PWR deep-sleep wake source and enters deep sleep; called once by the shutdown sequence (v0.5.0) |
 | `latchOn()` | true once the latch has been asserted |
 
-`GPIO18` is the PWR key itself. It is an input and is never driven by the
-firmware; it is only named in the log.
+`GPIO18` is the PWR key itself. It is an input and is never driven as an output;
+the firmware reads it and, since v0.5.0, arms it as the deep-sleep wake source.
 
 ### Boot order
 
-`keepBatteryPowerOn()` is the **first statement of `setup()`**, ahead of every
-driver:
+`keepBatteryPowerOn()` is the **first instruction of `setup()`** - the same
+property v0.4.1 had - and nothing is allowed before it. `keepBatteryPowerOn()`
+also drops a stale `GPIO17` pad hold internally, so no separate "release first"
+step is needed:
 
 ```text
 reset -> ROM bootloader -> second stage bootloader -> setup()
   |
-  +- 1. BoardPower::keepBatteryPowerOn()   GPIO17 = HIGH   <- latch asserted here
-  +- 2. Serial.begin(115200) + delay(200)
-  +- 3. BoardPower::begin()                the one-shot [power] lines
-  +- 4. Button, DeviceId, RecordingApp, audio (ES8311 + I2S)
-  +- 5. UI: e-paper -> touch -> battery ADC -> RTC -> TimeManager
-  +- 6. Wi-Fi (VM_ENABLE_UPLOAD)
+  +- 1. BoardPower::keepBatteryPowerOn()      GPIO17 = HIGH   <- latch asserted here
+  |                                            (drops a stale hold first)
+  +- 2. BoardPower::releaseSleepPadsIfNeeded() free GPIO18 from the RTC wake pad
+  +- 3. Serial.begin(115200) + delay(200)     first diagnostic output
+  +- 4. BoardPower::begin()                   the one-shot [power] lines
+  +- 5. microSD mount (VM_ENABLE_SD)
+  +- 6. Button, DeviceId, RecordingApp, audio (ES8311 + I2S)
+  +- 7. UI: e-paper -> touch -> battery ADC -> RTC -> TimeManager
+  |      -> Frank's boot animation (CLOSED -> AWAKE, two partial frames)
+  +- 8. Wi-Fi (VM_ENABLE_UPLOAD)
+  +- 9. PowerManager::begin()                 inactivity starts; PWR is DISARMED
 ```
 
-Two details matter:
+There is deliberately **one** application-level call between reset and the latch,
+and it is the latch itself. The comment in `setup()` says exactly that:
 
+```cpp
+// Battery boot critical path:
+// assert VBAT latch before any non-essential initialization.
+```
+
+Four details matter:
+
+* **A stale `GPIO17` hold cannot be deferred.** An engaged pad hold *overrides*
+  the output, so `gpio_set_level(17, 1)` would be silently ignored and the latch
+  could never be asserted. Releasing the hold therefore has to be part of the
+  assertion, not a step after it. `keepBatteryPowerOn()` does both, in the order
+  the ESP-IDF contract requires:
+  1. write `1` to the output register *while the hold is still active* (so the
+     pad is already being driven where we want it);
+  2. `gpio_hold_dis(17)` + `gpio_deep_sleep_hold_dis()`;
+  3. `gpio_config()` the pin as an output and write `1` again.
+
+  `esp_driver_gpio/include/driver/gpio.h` states the reason for that order:
+  *"the gpio will be set to the default mode, so, the gpio will output the
+  default level if this function is called. If you don't want the level changes,
+  the gpio should be configured to a known state before this function is
+  called."* Releasing the hold first would instead let the pad fall back to its
+  default level before we drive it. On a cold boot the hold is not engaged and
+  `gpio_hold_dis()` is a harmless no-op, so paying for it on every boot costs two
+  register operations and no time.
 * The pin is written HIGH **before** it is switched from high-Z to output.
   `gpio_set_level()` updates the output register without requiring the pin to be
   an output yet, so the pad goes from high-Z straight to HIGH and never emits the
   LOW pulse that a config-then-set order would produce. The internal pull-up is
   enabled exactly as in the official constructor.
-* Nothing else in the firmware writes `GPIO17`, so after step 1 the latch stays
-  asserted for the whole run: no periodic re-write, and no `[power]` line in
-  `loop()`.
+* Step 2 exists for the USB-attached "off" state: `rtc_gpio_deinit(18)` restores
+  `GPIO18` as a normal digital input instead of an RTC wake pad. It touches a pin
+  the latch does not depend on, so it is kept *after* the latch on purpose - the
+  set of things that happen before the rail is safe stays exactly one call long.
+* Nothing else writes `GPIO17` during normal operation, so after step 1 the latch
+  stays asserted for the whole run: no periodic re-write and no `[power]` line per
+  `loop()` iteration.
 
 The window from reset to step 1 (ROM + second stage bootloader) is not covered by
-firmware, so a PWR press must last long enough to reach `setup()`. Deep sleep,
-`esp_sleep_enable_*` and `gpio_hold_en()` are deliberately absent: the board
-never enters deep sleep, so a hold would have nothing to protect.
+firmware, so a PWR press must last long enough to reach `setup()`; a press shorter
+than that cannot latch the rail by any firmware means. Deep sleep,
+`esp_sleep_enable_ext1_wakeup_io()` and `gpio_hold_en()` are no longer absent -
+they are the shutdown path now, documented in
+[Power management](#power-management-pwr-key-auto-power-off-and-shutdown-v050).
 
 ### An e-paper screen is not a heartbeat
 
@@ -427,21 +505,477 @@ Expected at boot (once, never continuously):
 
 ```text
 [power] battery latch gpio=17 level=HIGH
-[power] PWR key gpio=18
+[power] PWR key gpio=18 active_low=1 debounce_ms=50
+[power] auto power-off enabled timeout_ms=120000
+[power] deep-sleep wake on PWR enabled (USB-attached off state)
 ```
 
 ### Battery latch physical test
 
-| # | Setup | Expected |
-| --- | --- | --- |
-| A | USB connected | normal boot, touch works, Wi-Fi connects, both `[power]` lines present |
-| B | unplug USB while running | board keeps running; touch keeps working; Wi-Fi stays up; the MCU does not freeze |
-| C | power off, then boot on battery only | press and **hold** PWR until `[power] battery latch gpio=17 level=HIGH` appears; releasing PWR afterwards leaves the board running |
-| D | after C | touch responds, tags change, Wi-Fi connects, a BOOT press records audio |
+The latch itself has one pass condition: with **USB disconnected**, start from an
+off board and press-and-**hold** PWR until
+`[power] battery latch gpio=17 level=HIGH` appears; releasing PWR afterwards must
+leave the board running. That is the actual latch test - it fails if the board
+dies on release. A press shorter than the bootloader + `setup()` time cannot latch
+the rail on any firmware, so "one quick tap" is not a valid pass condition.
 
-Step C is the actual latch test: it fails if the board dies on release. A press
-shorter than the bootloader + `setup()` time cannot latch the rail on any
-firmware, so "one quick tap" is not a valid pass condition.
+Everything else the PWR key now does - the post-boot arming release, the short
+press, auto power-off, the shutdown screen and the USB-attached case - is in
+[Power management](#power-management-pwr-key-auto-power-off-and-shutdown-v050),
+including the full physical script (A-H plus USB). **REQUIRES PHYSICAL
+VALIDATION.**
+
+## Power management: PWR key, auto power-off and shutdown (v0.5.0)
+
+v0.4.1 only ever *asserted* the battery latch. v0.5.0 adds the other half: the PWR
+key is debounced and armed, an inactivity timer switches the device off by itself,
+and a graceful shutdown sequence concludes the work in flight before the latch is
+released. Two rules shape every decision below:
+
+* the inactivity timer measures how long since the **user** interacted, never how
+  long since the firmware did something;
+* a shutdown request is **refused** (and the user told why) while a note exists
+  only in PSRAM, and **deferred** while a commit is in flight. The device
+  deliberately stays on rather than lose a note silently.
+
+### Hardware and confirmed polarity
+
+| Net | GPIO | Role | Level |
+| --- | --- | --- | --- |
+| `BAT_Control` / `VBAT_PWR` | 17 | battery power latch | HIGH = hold battery power, LOW = release |
+| `BAT_KEY` | 18 | PWR button | **ACTIVE LOW**: pressed = LOW, released = HIGH |
+
+The polarity is not guessed. It is confirmed from the official sources for this
+board, which are the evidence the firmware follows:
+
+```text
+ESP32-S3-Touch-ePaper-1.54-Schematic.pdf
+  (linked from the Waveshare docs "Resources-And-Documents" page)
+      net legend:  BAT_Control GP17, BAT_KEY GP18
+      R58 = 10K pull-up from BAT_KEY to 3V3
+      switch Key2 shorts BAT_KEY to GND when pressed
+      GPIO17 -> R64 1K -> T2 (S8050) base;
+      T2 collector pulls Q4 (AO3401 P-FET) gate low to conduct VBAT to VSYS
+
+waveshareteam/ESP32-S3-ePaper-1.54
+  02_Example/Arduino/07_BATT_PWR_Test/src/button_bsp/button_bsp.c
+      #define button2_active 0                     // PWR: valid/active level = 0 = LOW
+      gpio_conf.mode = GPIO_MODE_INPUT;
+      gpio_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+      gpio_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+      (read with gpio_get_level(PWR_BUTTON_PIN), polled from a 5 ms esp_timer)
+  02_Example/Arduino/11_RTC_Sleep_Test/src/power/board_power_bsp.cpp
+      const uint64_t ext_wakeup_pwr_mask = 1ULL << GPIO_NUM_18;
+      esp_sleep_enable_ext1_wakeup_io(..., ESP_EXT1_WAKEUP_ANY_LOW);
+```
+
+`07_BATT_PWR_Test/user_app.cpp` contains `vbat_scanStatus()` and
+`button_power_task()` whose arming flag is set on a **non-zero**
+`gpio_get_level(PWR_BUTTON_PIN)` and which then powers off - the opposite of the
+`button2_active 0` declared in the very same example. That pair is
+self-contradictory, so it is **not** followed. The schematic, the active-low
+declaration and the EXT1 `ANY_LOW` wake source are the three consistent pieces of
+evidence, and they are what `VM_PWR_KEY_ACTIVE_LOW 1` encodes.
+
+The polarity is confirmed from official sources; it is still to be confirmed
+physically on the board by tests A and B in the power script below.
+
+### Boot arming: the power-on press is not a shutdown request
+
+The dangerous failure mode is obvious once stated: on battery the user powers the
+board on by *holding* PWR. A naive `if (pressed) powerOff()` therefore reads the
+power-on press as a request to power off, and the device switches straight back
+off the instant the user lets go. The firmware cannot tell the two presses apart
+from the pin alone - at `t = 0` the key is simply down - so it does not try. It
+arms the button instead.
+
+`PowerButton` is a two-state machine:
+
+```text
+DISARMED_AFTER_BOOT   the only state at reset
+      |  key observed RELEASED and stable for the full debounce window
+      v
+ARMED                 one clean press -> release cycle emits exactly one request
+```
+
+* While **disarmed**, a press is ignored - and remembered, so it can never be
+  counted twice.
+* The first debounced **release** arms the button. Arming emits `Armed`, never a
+  shutdown request, so the release that ends the power-on press cannot switch the
+  device off.
+* Only a **later** press (held for the full debounce window, while armed) emits
+  `ShortPress`; releasing it closes the cycle without adding a second request.
+* If the user holds PWR for a very long time at boot and then lets go, the press
+  is still ignored and the release only arms.
+
+`VM_PWR_DEBOUNCE_MS` is **50 ms**, and it is the vendor-consistent value rather
+than a guess: the official example runs the `multi_button` library from a 5 ms
+`esp_timer` with that library's 50 ms default debounce window. It is comfortably
+above the mechanical bounce of a tactile switch (a few ms) and well below a
+deliberate human press (>= 150 ms).
+
+The key is **polled** from `loop()` - `digitalRead(VM_PWR_KEY_PIN)` fed to
+`PowerManager::tick()` - never from an ISR. There is no interrupt handler, no edge
+counter and no task for the button.
+
+### Short press: one press, one request
+
+After arming, one deliberate press produces exactly one shutdown request. A
+contact bounce is a run of opposite samples shorter than the debounce window, so
+it never produces an edge at all and one gesture cannot emit two requests. Holding
+the key down produces exactly one event (the press) and nothing else until it is
+actually released - it is not a stream of requests - and a press shorter than the
+window is not a press at all. No ISR is involved, so there is no interrupt-storm
+path either.
+
+### Auto power-off after inactivity
+
+With `VM_ENABLE_AUTO_POWER_OFF 1`, `PowerManager` powers the device off after
+`VM_AUTO_POWER_OFF_MS` (120000 ms = 2 minutes) with no user interaction. Both
+values are centralised in `config.h`, and the timeout is never spelled out in
+code - `power_manager.h`, `power_policy.h` and `recording_app.cpp` all use the
+macro.
+
+The elapsed-time test is millis()-safe:
+
+```cpp
+static_cast<uint32_t>(nowMs - lastActivityMs) >= timeoutMs
+```
+
+The subtraction is unsigned, so the comparison stays correct when the 32-bit
+counter wraps `0xFFFFFFFF -> 0`. The forbidden form `now > last + timeout` is not
+used anywhere.
+
+### What counts as activity
+
+The timer measures "how long since the user interacted", not "how long since the
+firmware did something". Background work must never keep the device awake
+forever, so the classification is explicit:
+
+| Resets the inactivity timer (user interaction) | Does **not** reset it (background work) |
+| --- | --- |
+| a valid FT6336 touch press (`TouchTap`) | Wi-Fi connect / disconnect |
+| tag selection (`TagSelected`) | NTP sync |
+| BOOT press or release (`BootButton`) | RTC read |
+| recording start (`RecordingStarted`) | upload start / finish |
+| recording end, by release or the 45 s limit (`RecordingStopped`) | a scheduled retry |
+| a PWR interaction the user can perceive (`PwrButton`) | SD remount |
+| any future explicit UI interaction (`UiInteraction`) | e-paper refresh |
+| | pending-count change |
+| | a log line |
+| | an internal timer |
+
+The switch decides, not the caller: `activity_is_user_interaction()` in
+`power_policy.h` is a `switch` over the whole `ActivityEvent` enum with **no
+`default:`**, so `-Wswitch` makes adding an event without classifying it a warning
+in every build. `PowerManager::markActivity()` also re-checks the classification
+and refuses a background event, so a mislabelled caller cannot silently disable
+the automatic power-off. The gestures that currently occur are published where
+they happen (touch in `UiController`, BOOT and the recording edges in
+`RecordingApp`, the PWR press in `PowerManager`); `RecordingStarted` and
+`TagSelected` are classified as interactions for their own call sites, and the
+physical gesture that causes each one already resets the timer through the event
+that does get published.
+
+### Shutdown inhibit reasons
+
+One enum answers "may the device power off right now?", so the log and the UI can
+name the reason instead of re-deriving it from booleans:
+
+| `ShutdownInhibit` | Class | Meaning |
+| --- | --- | --- |
+| `None` | - | nothing holds data that only exists in RAM; powering off is safe |
+| `Recording` | soft | audio is being captured (including `MaxReachedWaitingRelease`); finalize it first |
+| `Saving` | soft | a commit is in flight (`WAV`/metadata -> `tmp/` -> rename -> `pending/`); the request is deferred and completes as soon as the commit returns |
+| `FilesystemCritical` | soft, reserved | short-lived maintenance (a remount, a chunk read) is touching the volume; deferred like `Saving` |
+| `VolatileUnsavedRecording` | **hard** | the only copy of a recording lives in PSRAM (`Uploading` / `RetryWait`); powering off would destroy a note |
+
+The soft/hard distinction is the whole decision:
+
+* **soft** = the request is **deferred**. It is remembered, the work in progress
+  finishes - a commit is never abandoned halfway - and the shutdown proceeds by
+  itself the moment the inhibit clears.
+* **hard** = the request is **refused**. Nothing is queued; the device stays on and
+  keeps retrying, because powering off would destroy the only copy of a note. The
+  user is told `UNSENT NOTE` once per episode - not silently dropped, and not once
+  per `loop()` iteration.
+
+`shutdown_inhibit_for_state()` maps the recording state machine onto the enum, and
+`shutdown_inhibit_is_hard()` / `shutdown_inhibit_is_soft()` are the only places
+the distinction is made. `Recording` is classified soft because it is a transient
+"not yet" - but a request that arrives during a capture is **refused rather than
+remembered** (see the next sub-section): the end of the recording is itself a user
+interaction, so remembering the request would power the device off under the
+user's hand. `Saving` and `FilesystemCritical` are the soft cases that are
+genuinely deferred and completed.
+
+**A non-empty `pending/` queue is not an inhibit.** Committed recordings are
+already durable on the card and are recovered on the next boot, so `Idle` maps to
+`None` no matter how many notes are waiting.
+
+### PWR during recording, and during Saving
+
+| State | Outcome |
+| --- | --- |
+| `Recording`, `MaxReachedWaitingRelease` | **refused**: the recording continues, the panel shows `STOP RECORDING FIRST`, and PWR is never a stop control - BOOT is |
+| `Saving` | **deferred**: the commit is completed (`WAV`/metadata -> `tmp/` -> rename -> `pending/`) and only then does the device power off |
+
+A refused press during a capture is deliberately not remembered: if it were, the
+device would power itself off the moment the recording was committed, which the
+user never asked for. The notice stays on the panel until the condition clears,
+with `VM_UI_POWER_NOTICE_MIN_HOLD_MS` as the minimum.
+
+### The queue on the microSD
+
+Recordings already committed to the card are not a reason to stay awake. Whether
+`pending/` holds 1, 5 or 20 notes, the device powers off normally; on the next
+boot `recoverOnBoot()` rebuilds the queue from the card and the uploads continue
+where they left off. The final image is Frank's dead face (`FRANK_DEAD`, eyes
+`X X`); how many notes are still waiting is written to the log
+(`[power] SD queue safe pending=N`) and is shown on the panel only when the
+animation could not be flushed and the `POWERED OFF` fallback screen was painted
+instead (`N notes saved`), so the user is not left guessing whether the waiting
+audio survived. This is the whole point of
+[microSD persistence](#microsd-persistence-and-the-offline-queue-v050): the queue,
+not the PSRAM buffer, is what makes an unattended power-off safe.
+
+### Shutdown during an upload from the card
+
+If an upload from the card is in flight, the shutdown **may interrupt it** - the
+audio is already durable, so this is recoverable. Nothing is deleted: the item
+stays in `uploading/` (or is returned to `pending/`), boot recovery makes it
+pending again, and no HTTP 2xx is ever invented for a POST that did not finish.
+
+The interruption is bounded on purpose. The uploader polls a cooperative
+`abortFlag` between 4 KB chunks, but a worker already blocked inside a socket
+write would not see it; `Esp32IngressUploader::abortActiveTransfer()` therefore
+closes that socket from the main loop, so the blocked write fails immediately
+instead of holding the device for the 15 s HTTP timeout. The abort and the worker
+drain are bounded by `VM_PWR_UPLOAD_ABORT_TIMEOUT_MS` (500 ms), the main loop is
+serviced between polls every `VM_PWR_SHUTDOWN_POLL_MS` (10 ms), and the radio is
+stopped before any further waiting - so nothing in the shutdown path waits on the
+network.
+
+### Fallback without a microSD card: never lose a note
+
+If no card is mounted - or the card refused the commit, is full or is unhealthy -
+a finalized recording exists **only in PSRAM**, in `Uploading` or `RetryWait`.
+There is exactly one such buffer and no durable copy, so the firmware will not
+power off:
+
+* automatic power-off is blocked **indefinitely** - `VolatileUnsavedRecording` is
+  a hard block, so the timeout keeps its real age but never fires while the note
+  is at risk;
+* a PWR short press is **refused** and the panel owns the screen with `UNSENT
+  NOTE` / `Shutdown blocked` / `Waiting for upload`; the device stays on until the
+  ingress confirms the upload or the user power-cycles it by another means (for
+  example removing the battery or USB).
+
+No forced shutdown is implemented, and there is no override. Losing a note
+silently is deliberately not an option: the device prefers to stay on and keep
+retrying. This is otherwise the v0.4.1 path, where it was the only one.
+
+### The shutdown sequence
+
+`enterGracefulShutdown()` in `voice_memo_esp32.ino` runs the sequence once, from
+`loop()`, and never returns on success. The order is the safety argument:
+
+1. **Re-check the inhibit.** The request already came from `PowerManager`, which
+   refuses to emit one while data is at risk; this is a last, cheap line of
+   defence. If any inhibit is active the shutdown aborts and the device stays on.
+2. **Bounded wait for an in-flight commit.** A commit may still be running even
+   though the state machine just cleared; it is waited out (never interrupted),
+   bounded, so a wedged card cannot hang the power-off.
+3. **Interrupt an upload and stop the radio.** The cooperative abort flag is set
+   and the socket closed, then `esp_wifi_disconnect()` + `esp_wifi_stop()` run
+   *before* any further waiting, so a worker blocked on the network cannot turn
+   into a 15 s stall. No reconnect is ever started during shutdown.
+4. **Release the SD volume.** `RecordingStore::closeVolume()` unmounts the card.
+   Every write was already `flush()`ed and `close()`d by the store, and the commit
+   ends in a rename, so there is no dirty page to sync; the unmount is what
+   guarantees no handle survives the power cut. The release is refused while the
+   worker still owns a job, and bounded by
+   `VM_PWR_SHUTDOWN_CARD_RELEASE_TIMEOUT_MS` (2000 ms).
+5. **Play Frank's shutdown animation** (`AWAKE -> BLINK -> CLOSED -> DEAD`). Its
+   last frame is `FRANK_DEAD`, painted as a complete sprite with a **full**
+   refresh and waited for, so the eyes are already `X X` on the glass before the
+   latch is touched; that is the image the bistable panel keeps. The sequence
+   continues regardless of the outcome - the screen is the last thing that may
+   block a power-off, never the first. Every BUSY wait on this path
+   (`EpdDisplay::waitIdleFor()`) uses `VM_PWR_SHUTDOWN_EPD_TIMEOUT_MS`, not the
+   normal UI bound, and every failure is reported and survived. If not even one
+   Frank frame can be flushed (a panel that stopped answering), the pre-Frank
+   `POWERED OFF` screen is painted instead, on the same bounded full refresh, so
+   the user is still told how many notes are safe.
+6. **`audio.stop()`** - the codec stops driving I2S and the amplifier stays
+   disabled (playback was never enabled in this firmware).
+7. **Release the battery latch** (`BoardPower::powerOff()`) and, on USB, enter
+   deep sleep (see below).
+
+The display rail is deliberately left powered and the panel idle, which is the
+state the official Waveshare examples leave the panel in when they release the
+latch. Cutting the panel rail during or just after an update would risk corrupting
+the one image the user is left looking at; the ~30 uA it costs is accepted. Long
+`delay()`s are not used in normal operation: the periodic work is deadline-driven
+and `loop()` never blocks on the network, the card or the panel. The shutdown path
+is the one place allowed to block briefly, because the device is going away and
+nothing else needs the CPU.
+
+### USB connected: the latch alone is not enough
+
+Releasing GPIO17 is a real power-off only on battery. The schematic gives the
+board an independent `VBUS -> VSYS` path (`Q5` AO3401 with its gate on `VBUS` and
+`R68` 100K, and `U4` ETA6098), so with USB attached the board keeps running after
+the latch is released. Waveshare's own wiki also requires USB to be disconnected
+for its PWR-button power test.
+
+When `VM_PWR_WAKE_ON_PWR` is 1, `BoardPower::powerOff()` therefore does both
+halves of what the official RTC-sleep example does:
+
+1. drives `GPIO17` LOW and calls `gpio_hold_en(GPIO17)` so the released level is
+   held through sleep (otherwise the board's 100K `R63` would pull the gate back
+   up and the device would power itself on again);
+2. arms `GPIO18` as an EXT1 deep-sleep wake source:
+   `esp_sleep_enable_ext1_wakeup_io(1ULL << 18, ESP_EXT1_WAKEUP_ANY_LOW)`, plus an
+   explicit RTC pull-up, because with the RTC peripherals powered down the
+   internal digital pull-up no longer applies;
+3. calls `esp_deep_sleep_start()`.
+
+On battery the rail collapses before the sleep even matters; on USB the deep sleep
+is what makes "off" real, and pressing PWR wakes the device. At boot the other
+half is folded into the latch assertion: `keepBatteryPowerOn()` releases the RTC
+pad hold on `GPIO17` in the same call that drives it HIGH (a stale LOW hold would
+otherwise override the output and make the assertion impossible), and
+`releaseSleepPadsIfNeeded()` then calls `rtc_gpio_deinit(18)` immediately after.
+On a cold boot both are harmless no-ops.
+
+**REQUIRES PHYSICAL VALIDATION.** The USB-attached off state - whether it enters
+deep sleep, whether a PWR press wakes it, and whether the board really keeps
+running after the latch release on USB - has not been verified; it is documented
+here from the schematic, the official example and the code.
+
+### The e-paper keeps the last image
+
+The panel is bistable: it holds its image with **no power at all**, so the last
+image the firmware painted - `FRANK_DEAD`, the dead Frank with `X X` eyes, or the
+`POWERED OFF` fallback screen when the animation could not be flushed - remains
+visible after the device is off. That is also why a visible screen is **not**
+proof that the MCU is running - a stale image with dead touch and dead Wi-Fi is
+exactly what a released battery latch looks like. Both shutdown images
+deliberately have no live value (no clock, no battery, no Wi-Fi) because a frozen
+reading would be a permanent lie.
+
+### Serial log reference
+
+One line per event, never per `loop()` iteration:
+
+| Line | Emitted when |
+| --- | --- |
+| `[power] battery latch gpio=17 level=HIGH` | `BoardPower::begin()`, once at boot |
+| `[power] PWR key gpio=18 active_low=1 debounce_ms=50` | `BoardPower::begin()`, once at boot |
+| `[power] auto power-off enabled timeout_ms=120000` | `BoardPower::begin()` (or `auto power-off disabled`) |
+| `[power] deep-sleep wake on PWR enabled (USB-attached off state)` | `BoardPower::begin()` |
+| `[power] PWR disarmed after boot; waiting for a stable release` | `PowerManager::begin()`, once |
+| `[power] PWR release confirmed; shutdown button armed` | the first debounced release after boot |
+| `[power] PWR short press` | a short press while armed |
+| `[power] shutdown requested reason=user` | an allowed PWR request |
+| `[power] shutdown requested reason=inactivity` | an allowed inactivity timeout |
+| `[power] capture in progress: shutdown requests are refused` | once per recording episode |
+| `[power] commit in progress: shutdown requests are deferred` | once per commit episode |
+| `[power] shutdown deferred: recording` | a request during a capture (refused, never queued) |
+| `[power] shutdown deferred: saving` | a request during a commit (deferred, then completed) |
+| `[power] shutdown deferred: filesystem_critical` | the same, while maintenance holds the volume |
+| `[power] shutdown blocked: volatile recording not persisted` | a hard block: the note exists only in PSRAM |
+| `[power] shutdown blocked: volatile_unsaved_recording` | the same block, named by the policy layer |
+| `[power] inactivity timeout 120000 ms` | the timeout expires (announced once per interval) |
+| `[power] deferred shutdown proceeding reason=...` | the deferred request is granted |
+| `[power] preparing shutdown reason=...` | `enterGracefulShutdown()` starts |
+| `[power] SD release deferred: upload worker still active` | the volume could not be released yet |
+| `[power] SD queue safe pending=3` | the volume was released; also repeated as the sequence summary |
+| `[power] wifi stopped` | the radio was stopped |
+| `[power] shutdown screen on panel (N ms)` | the `POWERED OFF` full refresh finished (fallback path) |
+| `[frank] boot animation` | `UiController::playBootAnimation()`, once per boot (two frames: `closed`, `awake`) |
+| `[frank] frame <state> full\|partial N ms` | one animation frame finished (state, waveform, duration) |
+| `[frank] boot animation done in N ms` | the panel is awake; the home screen is painted next |
+| `[frank] shutdown animation` | the shutdown sequence reached the last image |
+| `[frank] shutdown animation done in N ms` | `FRANK_DEAD` is on the glass and waited for |
+| `[frank] ... aborted ...` / `frame ... failed` | the panel refused or lost a frame; the caller carries on |
+| `[power] battery latch OFF gpio=17 level=LOW` | `BoardPower::powerOff()` |
+| `[power] entering deep sleep; wake source=PWR gpio=18 level=LOW` | `BoardPower::powerOff()`, before `esp_deep_sleep_start()` |
+| `[boot] woke from deep sleep; PWR pressed=yes` | the next boot, when the reset was an EXT1 wake (`no` for another EXT1 pin) |
+
+Nothing is logged per loop iteration, and a host test asserts exactly that:
+`power_manager_test` counts zero `Serial` lines over 10 s of idle ticking.
+
+### Configuration
+
+| Flag (`config.h`) | Default | Meaning |
+| --- | --- | --- |
+| `VM_PWR_KEY_ACTIVE_LOW` | 1 | confirmed GPIO18 polarity: pressed = LOW |
+| `VM_PWR_DEBOUNCE_MS` | 50 | debounce window for the PWR key |
+| `VM_ENABLE_AUTO_POWER_OFF` | 1 | build the inactivity power-off (0 = off) |
+| `VM_AUTO_POWER_OFF_MS` | 120000 | inactivity timeout (2 minutes) |
+| `VM_ENABLE_MANUAL_POWER_OFF` | 1 | a PWR short press requests a shutdown |
+| `VM_PWR_WAKE_ON_PWR` | 1 | arm GPIO18 as an EXT1 (ANY_LOW) deep-sleep wake source |
+| `VM_PWR_SHUTDOWN_EPD_TIMEOUT_MS` | 6000 | BUSY bound for the shutdown screen (`waitIdleFor()`); the normal UI path keeps `VM_EPD_BUSY_TIMEOUT_MS` (5000) |
+| `VM_PWR_UPLOAD_ABORT_TIMEOUT_MS` | 500 | bound for an interrupted upload to hand the worker back |
+| `VM_PWR_SHUTDOWN_CARD_RELEASE_TIMEOUT_MS` | 2000 | bound for the SD volume to become releasable |
+| `VM_PWR_SHUTDOWN_POLL_MS` | 10 | main-loop servicing interval between shutdown polls |
+| `VM_UI_POWER_NOTICE_MIN_HOLD_MS` | 1200 | minimum time a power notice stays on the panel |
+
+Three of these are guarded with `#ifndef` so they can be overridden from the
+command line instead of by editing this file — `VM_ENABLE_AUTO_POWER_OFF`,
+`VM_PWR_WAKE_ON_PWR` and `VM_PWR_KEY_ACTIVE_LOW`:
+
+```bash
+# disable the inactivity power-off entirely
+--build-property compiler.cpp.extra_flags=-DVM_ENABLE_AUTO_POWER_OFF=0
+
+# release the latch only; do not deep sleep (USB keeps the board up)
+--build-property compiler.cpp.extra_flags=-DVM_PWR_WAKE_ON_PWR=0
+
+# flip the PWR polarity, if TEST B ever disproves the active-low reading
+--build-property compiler.cpp.extra_flags=-DVM_PWR_KEY_ACTIVE_LOW=0
+```
+
+The polarity switch is guarded deliberately: it is the one setting a physical test
+might force you to change, and being able to flip it from the build command keeps
+that diagnosis a one-line experiment instead of a source edit.
+
+Two BUSY bounds coexist on purpose. `EpdDisplay::waitIdle()` keeps the 5000 ms
+`VM_EPD_BUSY_TIMEOUT_MS` that every normal refresh uses, while `waitIdleFor()` takes
+an explicit deadline; the shutdown sequence passes the slightly more generous
+`VM_PWR_SHUTDOWN_EPD_TIMEOUT_MS` because the final image matters more than the
+milliseconds and the device is going away anyway. Neither wait can hang the
+power-off: both are deadlines, and `showShutdownScreen()` reports and survives
+their failure.
+
+### Physical test script (A-H) and the USB case
+
+**REQUIRES PHYSICAL VALIDATION.** Nothing below can be confirmed from code alone.
+A is the power-on path, B/C the manual power-off cycle, and D-H the inhibitions
+and fallbacks.
+
+| # | Setup | Action | Expected |
+| --- | --- | --- | --- |
+| A | USB disconnected, device off | press and **hold** PWR until the firmware asserts GPIO17, then release | the device stays on; the release does **not** power it off; the panel plays Frank's boot animation and then shows the READY home screen; log shows `PWR release confirmed; shutdown button armed` and no `shutdown requested` |
+| B | device on, at least 1 s after the initial release | single press PWR, release | log `PWR short press` then `shutdown requested reason=user`; panel plays `AWAKE -> BLINK -> CLOSED -> DEAD` and stays on `FRANK_DEAD`; the device powers off; touch and Wi-Fi stop responding; the e-paper keeps the dead face |
+| C | device off (after B) | press PWR again | normal boot |
+| D | device on | start a recording with BOOT, press PWR | the device does **not** power off; the panel shows `STOP RECORDING FIRST`; the recording is not corrupted; release BOOT to finish normally |
+| E | device on | do not interact | at ~120 s the log shows `inactivity timeout 120000 ms` then `shutdown requested reason=inactivity`, and the device powers off |
+| F | device on | wait ~100 s, tap a tag, wait 30 s | still on; it powers off ~120 s after the last interaction |
+| G | Wi-Fi off, card inserted | record a note, confirm `[store] committed`, wait 2 min | the device may power off (log `[power] SD queue safe pending=N`); power on again and the pending queue reappears and uploads |
+| H | card removed, Wi-Fi off | record a note, wait > 2 min | the device must **not** auto-power-off and must not lose the WAV; log `shutdown blocked: volatile recording not persisted`; pressing PWR shows `UNSENT NOTE` |
+
+With USB attached the same firmware is expected to behave differently, because
+VBUS keeps the rail up. Every expectation in this table is **to be confirmed
+physically** and is not asserted as verified:
+
+| # | Setup | Action | Expected |
+| --- | --- | --- | --- |
+| USB-1 | USB connected, device on | press PWR | `shutdown requested reason=user`; the e-paper plays Frank's shutdown animation and stays on `FRANK_DEAD`; the device enters deep sleep instead of stopping |
+| USB-2 | USB connected, device on | leave it idle | auto power-off fires at ~120 s and the device enters deep sleep |
+| USB-3 | USB connected, device asleep | press PWR | the device wakes; log `[boot] woke from deep sleep; PWR pressed=yes`; the latch is re-asserted and the device boots normally |
 
 ## TEST B: complete upload (ESP32 -> NUC ingress)
 
@@ -813,17 +1347,22 @@ button keeps being debounced while the POST is in flight.
 
 | State | Meaning | New recording? |
 | --- | --- | --- |
-| `Idle` | buffer free | yes |
+| `Idle` | buffer free; a persistent queue may be pending | yes |
 | `Recording` | capturing into PSRAM | already recording |
 | `MaxReachedWaitingRelease` | 45 s hit, waiting for the release | no |
-| `Uploading` | background POST owns the WAV | no |
-| `RetryWait` | attempt failed, same WAV kept for retry | no |
+| `Saving` | the frozen WAV is being committed to the microSD card | no |
+| `Uploading` | fallback path: background POST owns the PSRAM WAV | no |
+| `RetryWait` | fallback path: attempt failed, same WAV kept for retry | no |
 
-There is exactly one WAV buffer, so while `Uploading` or `RetryWait` owns it, a
-BOOT press is refused instead of overwriting the audio:
+With a healthy card the firmware never enters `Uploading`/`RetryWait`: a
+recording is committed to the card and uploaded from there, so `Idle` stays
+available and the next recording can start immediately. Those two states are the
+volatile fallback used when the card is absent, full or unhealthy - in that mode
+there is exactly one WAV buffer, so a BOOT press is refused instead of
+overwriting the audio:
 
 ```text
-[app] BOOT press ignored: upload busy id=... state=uploading
+[app] BOOT press ignored: buffer busy id=... state=uploading
 ```
 
 That line appearing immediately after `[upload] started` is the proof that
@@ -867,9 +1406,14 @@ timeout or connection refused means the ESP32 would fail too.
 
 - Success: HTTP `201` (accepted) and HTTP `200` (already_known).
 - Failure: anything else, including connect failure and timeout.
-- On failure the WAV stays in PSRAM, `recording_id` is preserved and the retry
-  reuses it. A new `recording_id` is generated only when a new recording starts.
-- Retry cadence is `VM_UPLOAD_RETRY_INTERVAL_MS` (5000 ms) in `config.h`.
+- On failure the WAV is kept, `recording_id` is preserved and the retry reuses
+  it. A new `recording_id` is generated only when a new recording starts.
+- With a microSD card the retry reads the same file from the card, so it also
+  survives a reboot; with no card the WAV stays in PSRAM.
+- The WAV is removed (or moved to `sent/`) only after a valid HTTP confirmation.
+- Retry cadence is `VM_UPLOAD_RETRY_INTERVAL_MS` (5000 ms) for the volatile
+  fallback and `VM_SD_QUEUE_RETRY_INTERVAL_MS` (5000 ms) for the persistent
+  queue, both in `config.h`.
 
 ### Troubleshooting
 
@@ -891,6 +1435,14 @@ timeout or connection refused means the ESP32 would fail too.
 | `[wifi] fallback timeout` | Fallback did not reach `WL_CONNECTED` in its window either (wrong/placeholder fallback password, or hotspot off) |
 | `[wifi] no known network available` | Neither the primary nor the fallback is reachable; the firmware stays offline in `RetryWait` and retries after `VM_WIFI_RETRY_INTERVAL_MS` |
 | `status=` in the `[wifi]` lines | Numeric `WiFi.status()`: `1` = `WL_NO_SSID_AVAIL`, `3` = `WL_CONNECTED`, `4` = `WL_CONNECT_FAILED`, `5` = `WL_CONNECTION_LOST`, `6` = `WL_DISCONNECTED`. Values `1`/`4`/`5` are transient while associating; a new `WiFi.begin()` must not be forced on them |
+| `[sd] card not present` | No card, a card not formatted FAT32, or an unreadable card. The firmware keeps working and shows `NO SD`; format the card as FAT32 (the vendor requires it) and reboot |
+| `[sd] write failed ... (io_error)` | The card was removed or failed mid-write. Nothing was lost: the recording stays in RAM and the queue is paused until `[sd] remounted` |
+| `[sd] storage full (free space reserve)` | Fewer than `VM_SD_MIN_FREE_BYTES` would remain. Delete uploaded files, or raise the limit only if you know the card has room; pending notes are never deleted automatically |
+| `[sd] storage full (queue limit reached)` | `VM_SD_MAX_PENDING` recordings are already waiting. Connect Wi-Fi so the queue drains; nothing is discarded |
+| `[store] quarantined corrupt audio id=...` | A `pending/*.wav` failed header/CRC validation. Inspect it under `corrupt/` on a computer; it is never uploaded |
+| `[store] quarantined metadata without audio id=...` | A sidecar with no WAV (and nothing in `tmp/`). The audio was lost before the commit; the sidecar is kept under `corrupt/` for diagnosis |
+| `[store] cleanup deferred id=...` | The ingress accepted the note but the card could not be updated (it was removed). The file stays and is re-delivered after a remount; the ingress answers `200 already_known` |
+| `[queue] pending=` never falls | Wi-Fi is down or the ingress is unreachable. The `[upload] failed ... source=sd` line above it says why |
 
 
 ## e-paper UI (v0.4.0)
@@ -923,6 +1475,7 @@ official board definition exactly.
 | Speaker amp / audio power | `GPIO46` (PA), `GPIO42` (power enable, active LOW) | `codec_board/board_cfg.h`, `user_config.h` |
 | BOOT / PWR button | `GPIO0` / `GPIO18` | `09_LVGL_V8_Test/user_config.h` |
 | Battery power latch (`BAT_Control`) | `GPIO17`, HIGH holds the battery rail | `07_BATT_PWR_Test/{user_config.h,src/power/board_power_bsp.cpp}` |
+| microSD | **1-bit SDMMC**: CLK `GPIO39`, CMD `GPIO41`, D0 `GPIO40`; no CS, no card-detect, no power-enable GPIO | `04_SD_Card/sdcard_bsp.cpp`, `11_FactoryProgram/.../epaper_config.h`, official schematic |
 
 The pin macros live in `config.h`; nothing about recording, upload, the ingress
 protocol or the multipart body changed.
@@ -953,7 +1506,7 @@ RecordingApp ──uiSnapshot()──► UiController ──UiView──► ui_d
 
 | File | Role |
 | --- | --- |
-| `board_power.{h,cpp}` | battery power latch (`GPIO17`); asserted first in `setup()` |
+| `board_power.{h,cpp}` | battery power latch (`GPIO17`); asserted as the **first** statement of `setup()` (v0.4.1 property restored) |
 | `voice_tags.h` | the four tags and their labels - the only place the strings exist |
 | `tag_selection.h` | selected tag vs tag frozen at `startRecording()` |
 | `ui_layout.h` | 200x200 geometry, tag rectangles, hit test |
@@ -961,6 +1514,8 @@ RecordingApp ──uiSnapshot()──► UiController ──UiView──► ui_d
 | `ui_screens.{h,cpp}` | the painter: view model -> pixels (pure, host-tested) |
 | `gfx_canvas.{h,cpp}` | 1bpp framebuffer primitives + 5x7 font renderer (pure) |
 | `font5x7.h` | generated glyph table |
+| `frank_sprites.h` | generated Frank asset pack: eight 200x200 frames + eight 96x52 face overlays, 1bpp `PROGMEM` |
+| `frank_face.{h,cpp}` | Frank's boot/shutdown animations and the sprite -> framebuffer copy |
 | `epaper_display.{h,cpp}` | SPI/GPIO/LUT/refresh driver (official sequence) |
 | `touch_ft6336.{h,cpp}` | FT6336 polling driver |
 | `battery_monitor.{h,cpp}` | ADC1 battery monitor |
@@ -974,18 +1529,101 @@ No LVGL and no extra Arduino library: four static screens on a monochrome panel
 are cheaper and far more predictable as a small direct framebuffer layer. The
 sketch still links only core libraries.
 
+### Frank: the boot and shutdown animations
+
+Frank is the device's character - pixelated Frankenstein - and he is drawn only by
+`frank_face.{h,cpp}`, from the generated pack in `frank_sprites.h`. Two sequences
+exist, and nothing else in the firmware knows a sprite state:
+
+```text
+power on    (persisted FRANK_DEAD) -> CLOSED -> AWAKE -> READY (home)
+power off   (home) -> AWAKE -> BLINK -> CLOSED -> DEAD -> deep sleep / latch off
+```
+
+* **Boot** runs in `setup()` through `UiController::playBootAnimation()`, right
+  after the panel is up and before Wi-Fi. It is deliberately only two frames -
+  "he opened his eyes" - because it sits on the critical path to the home screen:
+  no dead frame, no blink, no mouth animation. It is a *transition*: as soon as it
+  finishes, the existing `UiController::update()` paints the normal home screen
+  from `loop()`, and the animation is never a screen of its own. The first home
+  screen is forced onto the full waveform (by setting the existing
+  "partials since the last full refresh" counter to its limit), because a partial
+  paint over Frank's dark head would ghost behind the tag grid.
+* **The dead image is not redrawn at boot.** The panel is bistable, so the
+  `FRANK_DEAD` face the previous shutdown left is what the user sees while the
+  device is off. The driver's own init (`EpdDisplay::begin()`) does clear the panel
+  to white before the first frame - that is the mandatory base-image/full-refresh
+  sync the SSD1681 needs before any partial update - so the visible sequence at
+  power-on is `X X` (persisted, until the first driver command) -> white (init) ->
+  `— —` -> `• •` -> home. Two partial updates, no extra full refresh.
+* **Shutdown** runs inside `UiController::showShutdownScreen()`, i.e. from the one
+  graceful-shutdown sequence, after every inhibition check and after the card and
+  the radio are safe, immediately before `BoardPower::powerOff()`. A refused or
+  inhibited shutdown never reaches it, so no animation can play when the device
+  stays on.
+* **Assets.** Each state has a complete 200x200 frame (5000 B) and a 96x52 face
+  overlay (624 B). `frankBlitPacked()` copies a packed bitmap straight into the
+  panel framebuffer, one bit per pixel, **bit 7 = leftmost, set bit = ink**; the
+  panel wants the opposite polarity, so the copy inverts - and that is the only
+  place the two conventions meet. Every full frame is a `const` array, read from
+  flash in place: no frame is ever copied into RAM, and the only framebuffer is
+  the driver's existing 5000-byte one.
+* **Refresh.** Both boot frames use the **partial** waveform. The first one must be
+  a *complete* sprite (the framebuffer holds the driver's white boot picture, so a
+  face-only patch would leave two eyes floating with no head) and it is safe with
+  the fast waveform because `begin()` has just written a base image that matches
+  what the panel displays - exactly what a partial update needs. The second frame
+  copies only the face overlay, which is exactly equivalent because the animated
+  states differ from each other *only* inside that 96x52 rectangle -
+  `tests/frank_face_test.cpp` asserts that, and it is also why `FRANK_RECORDING`
+  (which also changes pixels elsewhere) is never animated face-only. The shutdown
+  animation uses the partial waveform for its three opening frames and ends on
+  `FRANK_DEAD` as a complete sprite with a **full** refresh that is waited for.
+  Expect a boot to cost two partial updates plus the home screen's one full
+  refresh (~0.4 s each frame, ~2.4 s for the home), and a shutdown about
+  `3 partials + 1 full refresh`; the panel, not the animation code, sets that pace.
+  `min_visible_ms` in the frame tables is a floor, never a delay for looks.
+* **Failure.** Every frame is bounded by the panel BUSY deadline
+  (`VM_EPD_BUSY_TIMEOUT_MS`) and the frame lists are compile-time arrays, so an
+  animation can neither run forever nor hang a boot or a shutdown. A panel that
+  fails sets the driver's fault flag and the firmware carries on without a face;
+  a shutdown whose animation fails falls back to the `POWERED OFF` screen.
+* **Unused states stay available.** `FRANK_HALF_OPEN`, `FRANK_BLINK`,
+  `FRANK_HAPPY`, `FRANK_RECORDING` and `FRANK_ERROR` are still in the pack and
+  still reachable on demand through `frankShow(display, state)` (the entry point
+  for a future RECORDING face, a HAPPY confirmation or an ERROR screen); the boot
+  simply no longer visits them.
+
 ### Screens
 
 | Screen | Shown when | Content |
 | --- | --- | --- |
-| READY | `Idle` + Wi-Fi up | time, Wi-Fi, battery, `READY`, 2x2 tag grid, `Hold BOOT to record` |
-| READY OFFLINE | `Idle` + Wi-Fi down | `OFFLINE`; recording stays allowed, the note will wait in the buffer |
+| READY | `Idle` + Wi-Fi up | time, Wi-Fi, battery, `READY`, a storage status line, 2x2 tag grid, `Hold BOOT to record` |
+| READY OFFLINE | `Idle` + Wi-Fi down | `OFFLINE`; recording stays allowed and the note is queued on the card |
 | RECORDING | `Recording` | `● REC`, `MM:SS`, the frozen tag, `Release to finish` |
 | MAX 45s | `MaxReachedWaitingRelease` | `MAX 45s`, `Release BOOT` |
-| UPLOADING | `Uploading` | `UPLOADING`, static arrow, `Tag · Ns`, `Please wait` |
-| RETRY WAIT | `RetryWait` | `WAITING FOR WIFI`, `Note preserved`, `RETRYING` |
+| SAVING | `Saving` | `SAVING`, `to microSD`, the frozen tag, `Do not remove card` |
+| UPLOADING | `Uploading` (fallback path) | `UPLOADING`, static arrow, `Tag · Ns`, `Please wait` |
+| RETRY WAIT | `RetryWait` (fallback path) | `WAITING FOR WIFI`, `Note preserved`, `RETRYING` |
 | SENT | upload accepted (`Idle` only) | check mark, `SENT`, `Voice saved` for 1.5 s, then READY |
 | BUSY hint | BOOT pressed while the buffer is busy | small inverted `BUSY` box in the footer, 1 s |
+
+The READY screen carries one line of storage truth between the heading and the
+tag grid - the only place the persistent queue is visible:
+
+| Condition | Line |
+| --- | --- |
+| storage I/O failure, card gone after a failure | `SD ERROR` |
+| last commit refused for space | `SD FULL` |
+| no card mounted | `NO SD` |
+| notes waiting, an upload is in flight | `up 3 pending` |
+| notes waiting, idle link | `3 pending` |
+| healthy card, empty queue | (nothing is drawn) |
+
+Background uploads deliberately do **not** take over the screen: the panel shows
+READY with the pending count so the user can start the next recording, which is
+the whole point of the queue. The SENT confirmation is still shown when the
+ingress accepts any queued note.
 
 No upload percentage is shown: the uploader reports no progress, so inventing one
 would be a lie. The arrow is static because an e-paper must not pretend to
@@ -1174,8 +1812,14 @@ snapshot that the upload task influences only through the existing result queue.
 
 ```text
 [power] battery latch gpio=17 level=HIGH
-[power] PWR key gpio=18
+[power] PWR key gpio=18 active_low=1 debounce_ms=50
+[power] auto power-off enabled timeout_ms=120000
+[power] deep-sleep wake on PWR enabled (USB-attached off state)
 [epd] panel ready in 2134 ms (official Waveshare driver, SPI2 40000000 Hz)
+[frank] boot animation
+[frank] frame closed partial 402 ms
+[frank] frame awake partial 371 ms
+[frank] boot animation done in 773 ms
 [ui] touch ready: FT6336 addr=0x38 rst=7 int=21 (idle level=1)
 [ui] ready: touch=yes battery=yes rtc=yes
 [battery] ADC1 channel 3 (GPIO4) ready; divider ratio x2; update every 30000 ms
@@ -1196,6 +1840,11 @@ snapshot that the upload task influences only through the existing result queue.
 Set `VM_ENABLE_UI 0` in `config.h` to build the pre-UI firmware (audio + upload
 only); the UI translation units are then dropped by the linker.
 
+The `[frank] frame ... ms` values are the real refresh time of each frame, which
+is what sets the pace of the animation: the illustrative numbers above assume
+~0.4 s per partial boot frame. They are **to be confirmed on the bench** - the log
+is the measurement.
+
 ### Residual risks (not verifiable without the board)
 
 * **Touch orientation.** The vendor example reports raw x/y clamped to the panel
@@ -1205,7 +1854,13 @@ only); the UI translation units are then dropped by the linker.
   mapping can be identified immediately.
 * **Panel timing.** Partial update time, ghosting rate and the 20-partial bound
   are engineering estimates; the serial log reports the measured refresh time so
-  the number can be tuned.
+  the number can be tuned. That now includes Frank's animation: how the partial
+  waveform renders the large black areas of a complete head (the boot's first
+  `closed` frame and the shutdown's frames) and how much of the home screen ghosts
+  behind the shutdown frames cannot be seen without the board. The two safety
+  valves are one-line changes in `frank_face.cpp`: promote a frame's
+  `full_refresh` to `true` (costs ~2.4 s, guarantees the image - it is the whole
+  cost the boot used to pay) or raise its `min_visible_ms` floor.
 * **Battery curve.** The voltage -> percentage curve is an approximation, not a
   datasheet characteristic.
 * **Power latch.** `GPIO17` HIGH is the official latch semantics, but the fix can
@@ -1213,11 +1868,588 @@ only); the UI translation units are then dropped by the linker.
   covered by firmware, so a PWR press shorter than the boot time cannot latch the
   rail. See "Battery latch physical test" above.
 
+## microSD persistence and the offline queue (v0.5.0)
+
+**PSRAM is a temporary capture buffer. microSD is persistence and the offline
+queue.** That one sentence is the whole design:
+
+| Storage | Role | Lifetime of the data |
+| --- | --- | --- |
+| PSRAM (1.44 MB, OPI) | the single capture buffer: I2S fills it and the WAV header is finalized in place | from `BOOT` press until the recording is committed to the card (or dropped in TEST A) |
+| microSD (FAT32) | durable copy of every committed recording plus its metadata, and the queue the background uploader drains | from the atomic commit until the ingress confirms delivery |
+
+Once a recording is committed, the firmware no longer depends on PSRAM for it.
+Losing Wi-Fi, rebooting, removing and reinserting the card, or a failed upload
+cannot lose it. While older notes are queued or uploading the user can keep
+recording: capture is the only thing serialized, not upload.
+
+### microSD hardware map (official sources)
+
+The card is wired as **1-bit SDMMC**, not SPI. That is the vendor's own
+implementation, not a preference:
+
+```text
+waveshareteam/ESP32-S3-ePaper-1.54 @ 9957d0f4
+  02_Example/Arduino/04_SD_Card/sdcard_bsp.cpp
+      #define SDMMC_D0_PIN  GPIO_NUM_40
+      #define SDMMC_CLK_PIN GPIO_NUM_39
+      #define SDMMC_CMD_PIN GPIO_NUM_41
+      sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+      slot_config.width = 1;              // 1-wire SDMMC
+      slot_config.clk = SDMMC_CLK_PIN;
+      slot_config.cmd = SDMMC_CMD_PIN;
+      slot_config.d0  = SDMMC_D0_PIN;
+      host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+  02_Example/ESP-IDF/V{1,2}/04_SD_Card/components/sdcard_bsp/sdcard_bsp.c   (identical)
+  02_Example/ESP-IDF/V2/11_FactoryProgram/components/port_bsp/epaper_config.h
+      #define SD_MISO_D0_PIN  GPIO_NUM_40
+      #define SD_MOSI_CMD_PIN GPIO_NUM_41
+      #define SD_CLK_PIN      GPIO_NUM_39
+      #define SDlist          "/sdcard"
+
+ESP32-S3-Touch-ePaper-1.54-Schematic.pdf (linked from the official
+Resources-And-Documents page), SD_Card block / GPIO table:
+      IO39 = SD_CLK, IO40 = SD_MISO, IO41 = SD_MOSI
+```
+
+| Item | Value | Source |
+| --- | --- | --- |
+| Interface | **1-bit SDMMC** (`slot_config.width = 1`) | `04_SD_Card/sdcard_bsp.cpp` |
+| CLK | `GPIO39` | schematic net `SD_CLK` + official example |
+| CMD / MOSI net name | `GPIO41` | schematic net `SD_MOSI` + official example |
+| DATA0 / MISO net name | `GPIO40` | schematic net `SD_MISO` + official example |
+| DATA1 / DATA2 | routed only to `NC` resistors, no ESP32 pin | schematic |
+| DATA3 / CS | 10 kOhm pull-up only, no ESP32 pin | schematic |
+| Card detect | hardwired to GND, no GPIO | schematic |
+| SD power enable | none; socket VDD is on the always-on 3V3 rail | schematic (U7 MP1605, EN tied to VSYS) |
+| Mount point | `/sdcard`, FAT32, `format_if_mount_failed = false` | official example |
+| Clock | `SDMMC_FREQ_HIGHSPEED` (40 MHz) | official example |
+
+There is no pin overlap with the e-paper (SPI2: DC 10, CS 11, SCK 12, MOSI 13,
+RST 9, BUSY 8, PWR 6), touch/I2C (RST 7, INT 21, SDA 47, SCL 48) or audio
+(MCLK 14, BCLK 15, WS 38, DIN 16, DOUT 45, PA 42/46). The only caveat is
+silicon-level: 39/40/41 are also the ESP32-S3 external-JTAG pins, which is
+irrelevant unless the JTAG eFuses are burned; this board debugs over the built-in
+USB_SERIAL_JTAG on IO19/IO20.
+
+The firmware uses the Arduino `SD_MMC` wrapper, which drives exactly that ESP-IDF
+SDMMC driver: `SD_MMC.setPins(39, 41, 40)` + `SD_MMC.begin("/sdcard", true)`
+selects slot 1, 1-bit width, the official pins and the official mount point (the
+core sets `slot_config.width = 1` when `mode1bit` is true). The mount is never
+formatted; a card that cannot be mounted simply disables persistence.
+
+### Modules
+
+| File | Role | Arduino free? |
+| --- | --- | --- |
+| `vm_fs.h` | abstract volume + read handle, and the RAII volume lock | yes |
+| `sd_storage.{h,cpp}` | the only file that includes `SD_MMC`: mount, pins, health, remount, self-test | no |
+| `recording_paths.h` | the whole on-card layout in one place | yes |
+| `recording_meta.{h,cpp}` | metadata struct + canonical flat JSON + strict parser | yes |
+| `record_crc32.{h,cpp}` | CRC-32 (IEEE) over a byte range | yes |
+| `recording_store.{h,cpp}` | semantic queue: atomic commit, boot recovery, item lifecycle, backpressure, ordered cache | yes |
+| `upload_source.h` | `ByteSource` + `MemoryByteSource` for the multipart body | yes |
+| `uploader.{h,cpp}` | streaming multipart upload (one framing for RAM and card) | no |
+| `tests/memory_file_system.h` | in-memory volume with fault injection for the host tests | yes |
+
+Nothing outside `sd_storage.cpp` calls `SD_MMC`, and nothing outside
+`recording_store.cpp` builds a path.
+
+### Card layout
+
+```text
+/voice_memo/
+    pending/     <recording_id>.wav + <recording_id>.json   committed, not yet delivered
+    uploading/   <recording_id>.wav + <recording_id>.json   an attempt was in flight
+    tmp/         <recording_id>.wav.tmp / .json.tmp         never a valid recording
+    corrupt/     quarantined files that failed validation
+    sent/        optional retention (VM_SD_KEEP_SENT = 1), otherwise unused
+```
+
+Nothing else on the card is touched. The mount point is `/sdcard`; the firmware
+only ever writes under `<root>` (`VM_SD_ROOT`, default `/voice_memo`).
+
+### Commit protocol (atomicity)
+
+A finalized WAV becomes durable through exactly one rename:
+
+```text
+1. write /voice_memo/tmp/<id>.json.tmp     metadata first: it is the intent record
+2. write /voice_memo/tmp/<id>.wav.tmp      the audio, still not a recording
+3. rename tmp/<id>.json.tmp -> pending/<id>.json
+4. rename tmp/<id>.wav.tmp  -> pending/<id>.wav     <-- the commit point
+```
+
+Only after step 4 does the firmware consider the recording persisted and free
+the PSRAM buffer. A crash before step 4 leaves only `.tmp` files, which are
+discarded at boot (nothing was ever confirmed). A crash *between* steps 3 and 4
+leaves a committed sidecar plus a tmp WAV, and recovery finishes the commit
+because the sidecar proves the intent. Either way no partially written file can
+ever look like a valid recording, and a recording never disappears between
+"finalize" and "enqueue".
+
+### Metadata schema
+
+`<recording_id>.json`, a flat, human-readable object, one key per line:
+
+```json
+{
+  "schema_version": 1,
+  "recording_id": "rec-00000001-0000ABCD",
+  "device_id": "bel-esp32-01",
+  "tag_index": 1,
+  "duration_ms": 5230,
+  "wav_bytes": 209244,
+  "sample_rate": 16000,
+  "created_utc": 1768478400,
+  "crc32": 2914185633,
+  "attempt_count": 0,
+  "sequence": 7
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | bumped on an incompatible change; a newer file is rejected rather than guessed at |
+| `recording_id` | idempotency key shared with the ingress, **never regenerated on retry** |
+| `device_id` | same value the multipart field carries |
+| `tag_index` | `VoiceTag` index frozen at `startRecording()` (the tag survives a reboot) |
+| `duration_ms` | advertised to the ingress |
+| `wav_bytes` | complete WAV size (44-byte header + PCM), re-checked against the card at boot |
+| `sample_rate` | 16000, stored so recovery can re-validate the header |
+| `created_utc` | Unix UTC seconds, or `0` when no trustworthy clock existed (offline boot with a never-set RTC) |
+| `crc32` | CRC-32 (IEEE) of the complete WAV; its presence is the "computed" flag, so a legitimate 0 is not confused with "absent" |
+| `attempt_count` | failed attempts so far; diagnostics only, never used for correctness |
+| `sequence` | persistent FIFO order assigned by the store (`0` only for a WAV recovered without a sidecar) |
+
+The parser accepts exactly one flat object of string/number values and rejects
+anything else, so a truncated or corrupt sidecar is detected instead of being
+half-applied. Unknown keys are ignored, so a newer writer cannot break an older
+reader.
+
+JSON was chosen over SQLite deliberately: the queue is bounded to a few dozen
+items on a FAT32 card, and a one-parse, inspectable, trivially recoverable file
+is the cheapest thing that survives a power cut.
+
+### Recording lifecycle (what changed)
+
+```text
+before (v0.4.1)                          now (v0.5.0, card present)
+
+BOOT -> Idle                             BOOT -> recover persistent queue -> Idle
+  |                                        |
+press -> Recording                       press -> Recording
+  |                                        |
+release -> finalize WAV in PSRAM         release -> finalize WAV in PSRAM
+  |                                        |
+  +-> Uploading (buffer frozen)            +-> Saving (buffer frozen; SD commit)
+  |     |                                  |     |
+  |     +- 2xx -> Idle (buffer freed)      |     +- Ok -> Idle (buffer freed, item queued)
+  |     +- err -> RetryWait (frozen)       |     +- full/error -> Uploading/RetryWait (fallback)
+  |                                        |
+  +- RetryWait blocks a new recording      +-> uploader drains the queue in background,
+                                                 in any state; a new recording is allowed
+```
+
+`Idle` is now the normal state after a recording even while uploads are pending.
+A queued upload is started while `Idle` and keeps running while the next note is
+captured; only the single PSRAM capture buffer is serialized, and no new card
+work is started during capture (see [Concurrency](#concurrency)).
+
+| State | Meaning | New recording? |
+| --- | --- | --- |
+| `Idle` | buffer free; the queue may be non-empty | yes |
+| `Recording` | capturing into PSRAM | already recording |
+| `MaxReachedWaitingRelease` | 45 s hit, waiting for the release | no |
+| `Saving` | the frozen WAV is being committed to the card | no (the PSRAM copy is still the only one) |
+| `Uploading` | volatile fallback: the PSRAM WAV is being POSTed (no card) | no |
+| `RetryWait` | volatile fallback: the POST failed, same WAV kept | no |
+
+`Uploading`/`RetryWait` are now the **fallback** path, used only when the card is
+absent, full or unhealthy. With a healthy card the firmware never enters them.
+
+### Uploading from the card
+
+The worker opens the WAV through a locked handle and copies it into the
+multipart body in `VM_UPLOAD_CHUNK_BYTES` (4 KB) chunks. The whole file is
+**never** copied into RAM: it is either in PSRAM (volatile fallback) or streamed
+from the card chunk by chunk. `Content-Length` comes from the metadata, so the
+body is still a single multipart POST to the same endpoint.
+
+Preserved unchanged:
+
+* `recording_id` and `device_id` (idempotency keys, identical on every retry);
+* the tag (in the metadata; not yet a multipart field, exactly as before);
+* the endpoint `POST /api/v1/audio` and the base-URL normalization;
+* the multipart field set and `firmware_version`;
+* `201` = accepted, `200` = already known, anything else = failure.
+
+The WAV is deleted (or moved to `sent/`) **only** after a valid HTTP
+confirmation. A failed attempt keeps the file and the id and retries every
+`VM_SD_QUEUE_RETRY_INTERVAL_MS`. Nothing is ever left "stuck" in `uploading/`: an
+attempt moves the item there before the POST, and recovery returns it to
+`pending/` after a reboot.
+
+A recording the ingress keeps rejecting does **not** starve the queue: once an
+item reaches `VM_SD_QUEUE_MAX_ATTEMPTS` failed attempts it is skipped in favour
+of newer notes and retried only at `VM_SD_QUEUE_MAX_BACKOFF_MS`. It is never
+deleted or quarantined for failing to upload - it stays on the card with its id
+and is delivered as soon as the server accepts it.
+
+`recording_id` is minted once per recording and reused on every retry. It mixes
+in a hardware random nonce, so an id can no longer collide with one from an
+earlier boot; if the card nevertheless already holds a recording with the same
+id, the commit is refused, a fresh id is minted and the commit is retried (the
+audio has not been uploaded yet, so this is safe), which prevents the ingress
+from silently deduplicating a brand-new note as `already_known`.
+
+### Recovery on boot
+
+`RecordingStore::begin()` mounts the card, creates the layout and rebuilds the
+queue without trusting any previous RAM state:
+
+| Case | Result |
+| --- | --- |
+| A. reboot during capture, before saving | PSRAM audio is lost - accepted, documented |
+| B. reboot during the `.tmp` writes | tmp files are discarded; they never become `pending/` |
+| C. reboot between the two commit renames | the tmp WAV is promoted because the sidecar proves the intent; if that promotion cannot be done, the tmp WAV and sidecar are **kept** for the next boot, never deleted |
+| D. reboot during an upload | `uploading/` items are moved back to `pending/` and retried; an item that cannot be moved is still queued from `uploading/` |
+| E. upload confirmed, reboot before cleanup | the ingress is idempotent on `recording_id`; the replay returns `200 already_known` and the item is removed |
+| F. `pending/*.json` with no audio | quarantined to `corrupt/` (never guessed at), unless a `tmp/<id>.wav.tmp` is still there because the commit can still be completed |
+| G. `pending/*.wav` with no sidecar | validated from its header, hashed, given a fresh sidecar carrying the real CRC and kept - the audio survives |
+| H. corrupt or structurally invalid audio | quarantined to `corrupt/`, never uploaded |
+
+Recovery reads only a 44-byte header per file (cheap); a WAV found without a
+sidecar is the one case that is hashed in full, so its rebuilt sidecar is
+truthful rather than a sentinel. Re-hashing every *other* pending WAV at boot is
+opt-in with `VM_SD_VERIFY_CRC_ON_BOOT 1`.
+
+### Working without a card / card removed / card full
+
+* **No card at boot.** The mount fails without formatting, the boot continues,
+  the UI shows `NO SD`, and the firmware behaves exactly like v0.4.1: one PSRAM
+  buffer that must be uploaded (or retried) before the next recording. This is
+  the deliberately lowest-regression fallback.
+* **Card removed during operation.** Every filesystem call returns `false`
+  instead of aborting; no `File` is ever used after a failure. A failed rename
+  or read on the upload path also marks the volume unhealthy, so the remount and
+  the recovery scan are triggered even when no new recording is made. The volume
+  is remounted at most every `VM_SD_RETRY_MOUNT_MS` (30 s) - never while an
+  upload handle is open, and never in a tight loop. A recording already
+  committed is never "forgotten": it is still on the card and reappears in the
+  queue after the remount. The UI shows `SD ERROR`. A recording being finalized
+  while the card is gone falls back to the volatile path so it is not lost
+  either. The queue head can never wedge: an item whose WAV is *provably* gone
+  (checked only on a healthy, mounted volume) is dropped from the queue, and a
+  recording the ingress keeps rejecting is skipped, not deleted.
+* **SD full.** Before writing, the store checks both the free-space reserve and
+  the queue length. When either would be crossed the commit is refused, nothing
+  on the card is touched, no pending recording is deleted, the UI shows
+  `SD FULL`, and the new recording is kept in PSRAM and sent through the volatile
+  fallback so it can still be delivered. Space is reclaimed only by confirmed
+  uploads.
+
+### Retention policy
+
+Default: after a confirmed upload the WAV and its sidecar are deleted. That is
+`VM_SD_KEEP_SENT 0`. Setting it to `1` moves both files to `sent/` instead, which
+is the hook for a future retention window. `sent/` is never scanned at boot and
+never blocks the queue.
+
+### CRC and integrity
+
+CRC-32 (IEEE) is computed once, when the recording is committed, and stored in
+the sidecar. Boot recovery always runs the cheap structural checks:
+
+* file exists and is at least 44 bytes;
+* `RIFF` / `WAVE` / `fmt ` / `data` markers, 16-byte PCM fmt chunk, format 1;
+* one channel, 16 bits, 16000 Hz;
+* the `data` chunk exactly fills the file and the `RIFF` size matches it;
+* an even payload (whole 16-bit samples).
+
+The full CRC re-hash is `VM_SD_VERIFY_CRC_ON_BOOT` (default `0`, because hashing
+a full queue would add seconds to the boot). The CRC is always written, so it is
+available for diagnostics and can be verified on demand.
+
+### Concurrency
+
+The volume is shared by the Arduino loop task (commit, mark, remove) and the
+`vm_upload` task (sequential reads of a pending WAV). All access goes through a
+single **recursive** FreeRTOS mutex owned by the storage backend:
+
+```text
+lock -> open / rename / read chunk -> unlock      (short filesystem operations)
+HTTP write                                        (no lock held)
+lock -> mark uploaded / mark pending -> unlock
+```
+
+A recursive mutex is required because `RecordingStore` holds the lock across a
+multi-step atomic commit while the per-operation backend calls take it again; a
+plain mutex would deadlock the task against itself. The mutex is never held
+across HTTP. In practice contention is nil: the main loop only issues a new job
+after the previous outcome was drained (`jobInFlight_`), so the two tasks
+alternate rather than overlap.
+
+Nothing filesystem-heavy ever runs while audio is being captured:
+
+* the remount + recovery scan is deferred out of
+  `Recording`/`MaxReachedWaitingRelease`/`Saving`;
+* a queued upload is *started* only in `Idle` (an upload already in flight still
+  finishes during a recording - that is the point of the queue);
+* a queued upload's outcome is held back while capture is running
+  (`markUploaded` removes a ~1.4 MB file, `markPendingAgain` renames and rewrites
+  a sidecar), then applied as soon as capture ends.
+
+A newly finalized recording takes priority over a queued upload: the loop sets an
+abort flag, the worker stops at the next chunk, the item goes back to `pending/`,
+and the commit runs immediately.
+
+### Backpressure
+
+Two independent limits, both checked before the card is touched:
+
+| Limit | Default | Meaning |
+| --- | --- | --- |
+| `VM_SD_MAX_PENDING` | 64 | maximum recordings in the queue (~92 MB of 45 s notes) |
+| `VM_SD_MIN_FREE_BYTES` | 1 MiB | space that must remain *after* the write, so the filesystem never fills up |
+
+The queue is bounded on purpose: an unbounded offline queue would fill the card
+silently.
+
+### Configuration
+
+| Flag (`config.h`) | Default | Meaning |
+| --- | --- | --- |
+| `VM_ENABLE_SD` | 1 | build the microSD queue (0 = exactly the v0.4.1 behaviour) |
+| `VM_SD_ROOT` | `/voice_memo` | root of the layout on the card |
+| `VM_SD_MOUNT_POINT` | `/sdcard` | SDMMC mount point |
+| `VM_SD_CLK_PIN` / `VM_SD_CMD_PIN` / `VM_SD_D0_PIN` | 39 / 41 / 40 | official 1-bit SDMMC pins |
+| `VM_SD_FREQ_KHZ` | 40000 | SDMMC clock (`SDMMC_FREQ_HIGHSPEED`) |
+| `VM_SD_MAX_OPEN_FILES` | 8 | VFS file handle budget |
+| `VM_SD_MAX_PENDING` | 64 | queue length limit |
+| `VM_SD_MIN_FREE_BYTES` | 1 MiB | free-space reserve |
+| `VM_SD_RETRY_MOUNT_MS` | 30000 | remount cadence after an I/O error |
+| `VM_SD_KEEP_SENT` | 0 | delete after upload, or keep in `sent/` |
+| `VM_SD_VERIFY_CRC_ON_BOOT` | 0 | full CRC re-hash during recovery |
+| `VM_SD_SELF_TEST` | 0 | write/read/verify/remove a test file under `tmp/` on every boot |
+| `VM_UPLOAD_CHUNK_BYTES` | 4096 | streaming chunk size for the multipart body |
+| `VM_SD_QUEUE_RETRY_INTERVAL_MS` | 5000 | retry cadence for the persistent queue |
+| `VM_SD_QUEUE_MAX_ATTEMPTS` | 10 | after this many failed uploads an item is skipped (not dropped) so it cannot starve newer notes |
+| `VM_SD_QUEUE_MAX_BACKOFF_MS` | 600000 | slow retry interval for items at the attempt cap (10 min) |
+
+### Serial log reference
+
+```text
+[sd] initializing...
+[sd] mounted type=sdhc total=31914983424 free=31869104128
+[sd] root=/voice_memo
+[store] recovered=2 discarded_tmp=1 corrupt=0
+[queue] pending=2
+[store] saving id=rec-00000003-0000ABCD bytes=209244
+[store] committed id=rec-00000003-0000ABCD bytes=209244 crc=ADBEEF12
+[queue] pending=3
+[upload] start id=rec-00000001-0000ABCD source=sd bytes=209244 duration_ms=6500 attempt=1
+[upload] accepted id=rec-00000001-0000ABCD http=201 source=sd
+[store] removed id=rec-00000001-0000ABCD
+[queue] pending=2
+[store] saving id=... (interrupted commit)          # recovery of case C
+[store] interrupted commit not completed id=... (kept for the next boot)
+[store] recovered id=... (interrupted upload)       # recovery of case D
+[store] quarantined corrupt audio id=...
+[store] dropped missing recording id=...
+[store] recording_id already on the card; retrying as id=...
+[queue] all items reached 10 attempts; retrying the oldest slowly
+[sd] storage full (free space reserve); recording kept in RAM
+[sd] write failed id=... bytes=... (io_error)
+[sd] volume marked unhealthy; will retry mount
+[sd] remounted; pending=3
+[sd] card not present
+```
+
+Never printed: Wi-Fi passwords, `INGEST_TOKEN`, or audio content.
+
+### microSD physical test script
+
+**REQUIRES PHYSICAL VALIDATION.** Nothing below can be confirmed from code alone.
+
+**Bring-up (once, before connecting the app):**
+
+1. Set `VM_SD_SELF_TEST 1` in `config.h` and flash. With a FAT32 card inserted
+   (16 MB-32 GB; the vendor states FAT32 is required) expect:
+
+   ```text
+   [sd] initializing...
+   [sd] mounted type=sdhc total=... free=...
+   [sd] self-test ok (write/read/verify/remove)
+   ```
+
+2. Confirm `/voice_memo/{pending,uploading,tmp,corrupt,sent}` exist on the card
+   and that no other file was touched.
+3. Set `VM_SD_SELF_TEST 0` again for production.
+
+**End-to-end scenarios:**
+
+| # | Scenario | Steps | Expected |
+| --- | --- | --- | --- |
+| 1 | Online | Wi-Fi up, ingress up, record A | `[store] committed`, `[queue] pending=1`, `[upload] start ... source=sd`, `[upload] accepted`, `[store] removed`, `pending=0`; no WAV left on the card |
+| 2 | Offline queue | Wi-Fi down, record A, B, C | all three record back-to-back; `pending=3`; the panel shows `3 pending` in READY; the third press is *not* refused |
+| 3 | Reboot offline | with 3 pending, power-cycle | `[store] recovered=0` (already committed), `[queue] pending=3`; the three notes still on the card |
+| 4 | Reconnect | bring Wi-Fi up | `[queue] pending` falls 3 -> 2 -> 1 -> 0 in `sequence` order; the ingress log shows the three `recording_id`s |
+| 5 | Reboot during upload | pull power while `[upload] started ... source=sd` is in flight | after boot: `[store] recovered id=...(interrupted upload)`, `[queue] pending=1`, the same `recording_id` re-uploaded; the ingress answers `201` or `200 already_known` |
+| 6 | Card removed while Idle | pull the card | no crash, no reset; UI shows `SD ERROR` after the first failed access; uploads pause; reinsert -> `[sd] remounted` within 30 s and the queue is rebuilt |
+| 7 | No card at boot | boot with the slot empty | boot completes; `[sd] card not present`; UI shows `NO SD`; recording still works via the PSRAM fallback |
+| 8 | Full card | fill the card (or set `VM_SD_MIN_FREE_BYTES` very high in a test build) and record | `[sd] storage full ...; recording kept in RAM`; UI shows `SD FULL`; no pending file was deleted; the note is still uploaded when Wi-Fi returns |
+| 9 | Recording while uploading | with a slow link, start recording B right after A was committed | `UPLOADING` is not shown for A (background), the panel stays usable, B records normally, both end up on the ingress |
+| 10 | Bad card | insert a card the board cannot read | `[sd] card not present`; the firmware keeps working; no repeated reset |
+
+### Performance notes
+
+**REQUIRES PHYSICAL VALIDATION** for the numbers; what follows are the design
+guarantees, which are testable from code:
+
+* The queue is an **in-memory ordered cache**. `pendingCount()`, `oldestPending()`
+  and the UI all read it, so the main loop never scans the card. The only scan is
+  `recoverOnBoot()` (and a remount, which rebuilds it), where per file the cost is
+  one 44-byte header read.
+* The loop never blocks on the card: the commit and every upload run on the
+  `vm_upload` worker. The only main-loop filesystem work is a rename/remove per
+  attempt, and it happens after the outcome was drained.
+* The atomic commit writes the WAV once (1.44 MB maximum, ~0.4-1.5 s at typical
+  SDMMC speeds) and never copies it: `writeFile` streams the PSRAM buffer straight
+  to the card. `SAVING` is visible on the panel for exactly that window.
+* The uploader streams in 4 KB chunks; the peak added RAM is the chunk buffer on
+  the worker stack plus the metadata String, never the WAV size. The worker stack
+  is 12 KB for that reason.
+* The persistent `sequence` makes ordering O(n log n) at recovery and O(1) per
+  dequeue; a retry never reorders the queue.
+* Measured on the bench, record: time to commit a 45 s note (`[store] saving` ->
+  `[store] committed`), free heap/PSRAM before and after a commit and an upload,
+  `uxTaskGetStackHighWaterMark` for `vm_upload`, and whether the BOOT button and
+  audio stay clean while a background upload runs (scenario 9).
+
+### Known limitations
+
+* **REQUIRES PHYSICAL VALIDATION.** All of the above assumes the 1-bit SDMMC
+  pins, the 40 MHz clock and the board's pull-ups behave as the vendor code and
+  schematic describe. Nothing here was measured on hardware.
+* The uploader does not report progress, so neither the UI nor the log invents a
+  percentage (unchanged from v0.4.1).
+* If the worker is blocked inside `WiFiClient::connect()` when a recording is
+  finalized, the commit waits for that call to time out (bounded by
+  `VM_UPLOAD_TIMEOUT_MS`, 15 s). The item is safe on the card and the SAVING
+  screen is shown meanwhile; only starting a *new* recording is delayed. The
+  response read has its own `VM_UPLOAD_TIMEOUT_MS` deadline, so a peer that
+  leaves the connection open without sending anything can no longer spin the
+  worker forever and hold the single job slot.
+* Background uploads now run while audio is captured, which is new in v0.5.0.
+  The worker is priority 1 and unpinned, so on the dual-core ESP32-S3 it should
+  not disturb I2S; confirm audio quality with scenario 9 on the bench.
+* FAT rename atomicity is the strongest guarantee FAT32 offers; a power cut
+  exactly during the rename is handled by recovery but is not provable from code.
+* Time on the card (`created_utc`) is 0 until the RTC or NTP is trustworthy;
+  ordering uses the persistent `sequence`, so a missing clock never reorders the
+  queue.
+
 ## Host-side tests
 
-Six pieces of firmware logic have no Arduino/Wi-Fi dependency and are tested on
-the Mac without a board. The `tests/` directory is not part of the sketch build
-(Arduino only compiles the sketch root and `src/`).
+Ten pieces of firmware logic have no Arduino/Wi-Fi/FreeRTOS dependency and are
+tested on the Mac without a board, including the whole persistent-store policy
+(paths, metadata, atomic commit, recovery, queueing, retention), the whole power
+policy (PWR arming, activity classification, inhibition and the shutdown
+decision) and Frank's sprite pipeline (bit order, polarity, asset geometry). The
+`tests/` directory is not part of the sketch build (Arduino only compiles the
+sketch root and `src/`).
+
+### Run every suite at once
+
+```bash
+cd voice_memo_esp32
+./tests/run_host_tests.sh
+```
+
+It compiles and runs all ten compiled suites with `-Wall -Wextra` into
+`$TMPDIR`, runs one source-level guard, and exits non-zero if anything fails. All
+eleven steps pass: `ingest_target`, `recording_state`, `wifi_fallback`,
+`time_zone`, `firmware_calc`, `recording_store`, `ui_model`, `frank_face`
+(78 checks), `power_button` (41 checks), `power_manager` (74 checks) and
+`power_critical_path_check`. The individual commands are listed below.
+
+Ten of the eleven are compiled C++ suites. The eleventh,
+`tests/power_critical_path_check.sh`, is a **source-level guard** and is
+deliberately different: the battery boot critical path is a property of statement
+order inside `setup()` — the VBAT latch must be asserted before any non-essential
+initialization — and no executable host test can observe that, because it is not
+runtime behaviour. The guard parses `setup()` and fails the run if:
+
+* the first executable statement is not `boardPower.keepBatteryPowerOn();`
+* `releaseSleepPadsIfNeeded()` is not the second
+* a `Serial` call or a `delay()` appears before statement 3
+* `GPIO17` is driven from anywhere other than `board_power.cpp`
+* the `// Battery boot critical path:` comment is removed or reworded
+* `keepBatteryPowerOn()` stops dropping the pad hold internally
+
+It was verified to fail against an intentionally reintroduced regression (moving
+`Serial.begin()` + `delay(200)` back above the latch makes five of its checks
+fail).
+
+### Persistent store test
+
+`vm_fs.h`, `recording_paths.h`, `recording_meta.{h,cpp}`, `record_crc32.{h,cpp}`
+and `recording_store.{h,cpp}` are Arduino free, so the exact on-card rules run
+against an in-memory volume (`tests/memory_file_system.h`) that also injects
+faults (unmountable card, failed writes, failed renames, full volume):
+
+```bash
+cd voice_memo_esp32
+c++ -std=c++11 -Wall -Wextra -I. -o /tmp/recording_store_test \
+    tests/recording_store_test.cpp recording_store.cpp recording_meta.cpp \
+    record_crc32.cpp wav_format.cpp identifier_utils.cpp
+/tmp/recording_store_test
+```
+
+262 assertions, grouped by rule:
+
+1. path construction, including rejecting `../` and `/` in a recording id;
+2. CRC-32 against the standard `"123456789" -> 0xCBF43926` vector, plus chained
+   (streaming) equality with the one-shot computation;
+3. WAV structural validation: valid, truncated, short, wrong sample rate, stereo;
+4. metadata round trip, and rejection of truncated JSON, nested values, wrong
+   value types, negative numbers, invalid ids, a future `schema_version` and
+   trailing garbage;
+5. commit + sidecar contents (tag, duration, size, CRC, sequence) and streamed
+   read-back;
+6. `.tmp` files never become `pending/` (commit atomicity);
+7. an interrupted commit (sidecar committed, WAV still in `tmp/`) is completed by
+   recovery;
+8. a reboot during `uploading/` returns the item to `pending/` with the same
+   `recording_id`;
+9. recovery of a WAV with no sidecar (kept, sidecar rebuilt) and of corrupt audio
+   or an orphan sidecar (quarantined to `corrupt/`);
+10. card absent (mount refused, saves rejected) and card full (both the
+    free-space reserve and the queue limit, with existing items untouched);
+11. the upload lifecycle: pending -> uploading -> pending on failure with the
+    same id and an incremented attempt count, then removal on success;
+12. a confirmed upload deletes only its own recording;
+13. oldest-first ordering survives a reboot (persistent `sequence`) and a retry;
+14. the optional `sent/` retention policy;
+15. card removed mid-attempt: no crash, no forgotten item, re-delivery after the
+    card returns - including an item that recovery could not move out of
+    `uploading/`, which must remain queued and readable from there;
+16. queue count consistency, including items in `uploading/` and quarantined
+    items;
+17. the volume lock is balanced on every path (and the backend's mutex is
+    recursive by design, because a commit nests per-operation calls);
+18. an interrupted commit whose promotion rename fails keeps the tmp WAV and its
+    sidecar (never deletes the only copy) and completes on a later boot;
+19. a half-moved pair (WAV in `uploading/`, sidecar in `pending/`) is read from
+    both directories instead of being quarantined as metadata-less;
+20. the per-item attempt cap skips a rejected recording instead of starving the
+    queue, and drops nothing;
+21. a provably missing file is dropped from the queue, while an unhealthy volume
+    never assumes absence;
+22. a pre-existing on-card file is treated as a duplicate and never overwritten;
+23. a WAV recovered without a sidecar gets a truthful CRC, so
+    `VM_SD_VERIFY_CRC_ON_BOOT 1` does not quarantine it on the next boot.
 
 ### URL/path test
 
@@ -1256,8 +2488,9 @@ c++ -std=c++11 -Wall -Wextra -o /tmp/recording_state_test tests/recording_state_
 It covers: `Idle -> press -> Recording`, `Recording -> release -> Uploading`,
 `Uploading + press -> still Uploading` (new recording refused),
 `Uploading -> Accepted/AlreadyKnown -> Idle`, `Uploading -> Failed ->
-RetryWait`, `RetryWait -> retry -> Uploading`, and that
-`Uploading`/`RetryWait` never allow the buffer to be overwritten.
+RetryWait`, `RetryWait -> retry -> Uploading`, that `Saving` freezes the buffer
+and commits to `Idle`, and that `Saving`/`Uploading`/`RetryWait` never allow the
+buffer to be overwritten.
 
 ### Wi-Fi fail-over test
 
@@ -1314,16 +2547,50 @@ c++ -std=c++11 -Wall -Wextra -I. -o /tmp/ui_model_test \
 /tmp/ui_model_test --dump   # + ASCII art of every screen (200x200, 1:1 pixels)
 ```
 
-It covers: every state -> screen mapping including `Idle + no Wi-Fi -> OFFLINE`,
-the SENT overlay (and that it never masks a real state), the BUSY hint, tag
-selection refused outside `Idle`, `selected` vs frozen `recording` tag, the four
-hitboxes (centres, exact edges, gutters, margins - 109 assertions), the full/partial
-refresh policy for every state, the transient timeout arithmetic across the
+It covers: every state -> screen mapping including `Idle + no Wi-Fi -> OFFLINE`
+and `Saving -> SAVING`, the SENT overlay (and that it never masks a real state,
+including `Saving`), the BUSY hint, tag selection refused outside `Idle`, the
+storage status line (`N pending`, `up N pending`, `SD FULL`, `SD ERROR`,
+`NO SD`) being painted only when there is something to say, `selected` vs frozen
+`recording` tag, the four hitboxes (centres, exact edges, gutters, margins - 109
+assertions), the full/partial refresh policy for every state (including that
+`Saving` can never block), the transient timeout arithmetic across the
 `millis()` wrap, the battery curve, layout sanity (cells inside the panel, no
-overlap, nothing clipped) and the inverted selected cell.
+overlap, nothing clipped, every new screen unclipped) and the inverted selected
+cell.
 
 `--dump` prints each screen as ASCII art, which is how the 200x200 layout was
 reviewed without the physical panel.
+
+### Frank sprite test
+
+The sprite copy in `frank_face.h` is pure, and `frank_sprites.h` is generated
+data, so the two things that could silently ruin the animation - a wrong bit
+convention and a wrong asset geometry - are checked on the Mac:
+
+```bash
+cd voice_memo_esp32
+c++ -std=c++11 -Wall -Wextra -I. -Itests -o /tmp/frank_face_test \
+    tests/frank_face_test.cpp gfx_canvas.cpp
+/tmp/frank_face_test          # assertions only
+/tmp/frank_face_test --dump   # + ASCII art of the boot frames' faces
+```
+
+78 assertions cover: every array being exactly `W*H/8` bytes (5000 for a full
+frame, 624 for a face overlay); the bit order (bit 7 = leftmost, checked with
+`0x80`, `0x01` and `0x1E`) and the polarity (a set bit is ink, and an all-zero
+bitmap must *paint* background rather than leave it alone); every one of the
+40000 pixels of all eight frames agreeing with an independently written decoder,
+with no ink pixel lost or invented (a corner-pixel check also catches a negative
+image); the 96x52 overlay being pixel-identical to the full sprite's face
+rectangle for all eight states - which is what makes the partial-refresh frames
+valid; every animated state differing from `AWAKE` only *inside* that rectangle
+while `FRANK_RECORDING` deliberately does not; and the five animated faces being
+pairwise distinct, so no frame is a stall.
+
+`-Itests` is only needed because the generated pack does `#include <Arduino.h>`;
+the test defines `PROGMEM` itself (it is empty on the ESP32 - `const` data is
+already in flash) and never links the panel driver, so no ESP32 core is involved.
 
 ### Timezone / clock test
 
@@ -1369,6 +2636,60 @@ It asserts the capture format (16000 Hz, 1 channel, 16-bit, 32 000 B/s), that
 payload both make the WAV header advertise exactly that duration, and that
 exactly one RX slot (`VM_I2S_RX_SLOT_LEFT`) is selected.
 
+### PWR key / boot arming test
+
+`power_button.h` is Arduino free, so the debounce and the mandatory post-boot
+arming run on the Mac, driven millisecond by millisecond. It covers cases 1-8 and
+11-14 and 27-28 of the specification:
+
+```bash
+cd voice_memo_esp32
+c++ -std=c++11 -Wall -Wextra -I. -Itests -o /tmp/power_button_test tests/power_button_test.cpp
+/tmp/power_button_test
+```
+
+41 checks: boot with PWR released; boot with PWR held; a power-on press held
+through `setup()` and then released (it arms, it never requests); exactly one
+request per press/release cycle; contact bounce on both edges not duplicating a
+request; a press shorter than the window being ignored; a press held for ten
+seconds emitting exactly one event and no release; two presses producing two
+requests; a long press that started while disarmed being ignored entirely; noise
+not arming the button; the `millis()` wrap across a debounce window; polarity
+parameterisation (an active-high build behaves consistently if the polarity were
+ever disproved on hardware); and the zero-debounce clamp.
+
+### Power policy / PowerManager test
+
+`power_policy.h` is fully Arduino free and `power_manager.h` needs only `Serial`,
+so the whole activity / inhibition / shutdown decision is driven here on a fake
+clock. It covers cases 9-28 plus the logging check:
+
+```bash
+cd voice_memo_esp32
+c++ -std=c++11 -Wall -Wextra -I. -Itests -o /tmp/power_manager_test tests/power_manager_test.cpp
+/tmp/power_manager_test
+```
+
+74 checks: 119999 ms is not 120000 ms and the timeout fires exactly once; a touch,
+a BOOT press or a tag selection restarts the interval while Wi-Fi, NTP, an RTC
+read, an upload, a retry, a remount, an e-paper refresh, a pending-count change
+and a log line never do; `Recording` and `MaxReachedWaitingRelease` suspend
+auto-off; `Saving` defers and then completes; a persisted queue allows the
+shutdown; a PSRAM-only note blocks it indefinitely with one `UNSENT NOTE`; the
+upload completing releases the shutdown without another two minutes; a PWR press
+during a capture is refused and not remembered; the `millis()` wrap-around; and
+zero log lines over 10 s of idle ticking.
+
+Neither power suite uses the ESP32 core. `power_manager.h` needs nothing from the
+board but `Serial`, so `tests/power_manager_test.cpp` includes
+`tests/arduino_shim.h` directly - a small (~60-line) `Serial` shim (`println` /
+`print` / `printf`, plus the line counter the logging check reads). The runner
+also passes `-Itests`, which puts `tests/Arduino.h` (a one-line facade over that
+shim) on the include path, so any `#include <Arduino.h>` in the power headers
+resolves to the shim rather than the ESP32 core. `power_button.h` and
+`power_policy.h` are fully Arduino-free. Nothing under `tests/` is compiled into
+the firmware - Arduino only builds the sketch root and `src/`.
+
 ### WAV slot diagnostic
 
 `tools/wav_slot_diagnostic.py` checks an existing recording for the I2S slot
@@ -1387,7 +2708,7 @@ follow the table. Each step lists what must appear on the panel and in the log.
 
 | # | Action | Panel | Serial |
 | --- | --- | --- | --- |
-| 1 | power on | `READY`, tag grid, footer | `[epd] panel ready`, `[ui] ready:`, the four `[ui] hitbox` lines |
+| 1 | power on | Frank wakes (`X X` persisted, then the driver's init clears the panel, then `— —` -> `• •`), then `READY`, tag grid, footer | `[epd] panel ready`, `[frank] boot animation`, two `[frank] frame ...` lines, `[frank] boot animation done in ... ms`, `[ui] ready:`, the four `[ui] hitbox` lines |
 | 2 | tap Work | Work inverted | `[ui] touch x=.. y=..` then `[ui] tag selected=Work` |
 | 3 | tap Idea | Idea inverted, Work normal | `[ui] tag selected=Idea` |
 | 4 | hold BOOT | `● REC`, `00:00` | `[app] BOOT press`, `[app] recording started ... tag=Idea` |
@@ -1416,11 +2737,14 @@ None required beyond the Arduino ESP32 core built-ins:
 WiFi
 Wire
 Preferences
+SD_MMC            (v0.5.0: microSD persistence, 1-bit SDMMC)
+FS
 driver/i2s_std.h
 driver/spi_master.h
 driver/gpio.h
 esp_adc/adc_oneshot.h
 esp_adc/adc_cali.h
+freertos/FreeRTOS.h, freertos/task.h, freertos/queue.h, freertos/semphr.h
 ```
 
 ## ES8311 attribution

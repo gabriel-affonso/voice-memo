@@ -85,4 +85,52 @@ bool validate_wav_header(
     return read_u32(data + 40) == expected_data_bytes;
 }
 
+bool validate_wav_structure(
+    const uint8_t* data,
+    size_t total_bytes,
+    uint32_t expected_sample_rate,
+    uint16_t expected_channels,
+    uint16_t expected_bits_per_sample,
+    uint32_t* out_data_bytes
+) {
+    if (data == nullptr || total_bytes < 44U) {
+        return false;
+    }
+    if (std::memcmp(data, "RIFF", 4) != 0 ||
+        std::memcmp(data + 8, "WAVE", 4) != 0 ||
+        std::memcmp(data + 12, "fmt ", 4) != 0 ||
+        std::memcmp(data + 36, "data", 4) != 0) {
+        return false;
+    }
+    if (read_u32(data + 16) != 16U) {
+        return false;  // not a canonical 16-byte PCM fmt chunk
+    }
+    if (read_u16(data + 20) != 1U) {
+        return false;  // not PCM
+    }
+    if (read_u32(data + 24) != expected_sample_rate ||
+        read_u16(data + 22) != expected_channels ||
+        read_u16(data + 34) != expected_bits_per_sample) {
+        return false;
+    }
+
+    const uint32_t data_bytes = read_u32(data + 40);
+    // The data chunk must exactly fill the file, and the RIFF size must match
+    // the file size: a truncated or padded WAV is rejected instead of uploaded.
+    if (read_u32(data + 4) != 36U + data_bytes) {
+        return false;
+    }
+    if (static_cast<uint64_t>(data_bytes) + 44U != static_cast<uint64_t>(total_bytes)) {
+        return false;
+    }
+    if (!wav_payload_is_aligned(data_bytes)) {
+        return false;
+    }
+
+    if (out_data_bytes != nullptr) {
+        *out_data_bytes = data_bytes;
+    }
+    return true;
+}
+
 }  // namespace voice_memo_firmware

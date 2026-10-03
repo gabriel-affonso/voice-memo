@@ -29,9 +29,32 @@ struct UiView {
     // "HH:MM" or "--:--".
     const char* time_text = "--:--";
     // Elapsed seconds source: live while Recording, frozen duration once the WAV
-    // is finalized (Uploading/RetryWait).
+    // is finalized (Saving/Uploading/RetryWait).
     uint32_t elapsed_ms = 0;
     bool busy_hint = false;
+
+    // --- power feedback -----------------------------------------------------
+    // "STOP RECORDING FIRST": a PWR press was refused mid-capture.
+    bool stop_recording_hint = false;
+    // "UNSENT NOTE": a shutdown was refused because the only copy of a
+    // recording lives in PSRAM. Owns the screen when set, because it is the
+    // explanation the user needs and the state may already be back to READY.
+    bool unsent_note_hint = false;
+    // Number of persisted recordings still waiting on the card, shown on the
+    // POWERED OFF screen so the user knows the notes survived the shutdown.
+    uint32_t power_off_pending = 0;
+
+    // --- persistent queue status -------------------------------------------
+    // Card mounted and layout present. false renders "NO SD".
+    bool sd_available = false;
+    // I/O failure: the oldest, most urgent thing to tell the user.
+    bool sd_error = false;
+    // The card refused the last commit for space.
+    bool storage_full = false;
+    // Recordings on the card the ingress has not confirmed yet.
+    uint32_t pending_count = 0;
+    // A background upload from the card is in flight right now.
+    bool background_upload = false;
 };
 
 // Paints a complete screen into the canvas (the canvas is cleared first).

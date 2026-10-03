@@ -25,18 +25,23 @@
 
 namespace voice_memo_ui {
 
-// One screen per firmware state, plus the two feedback screens the UI adds:
+// One screen per firmware state, plus the feedback screens the UI adds:
 //   Sent       : transient "SENT" confirmation after a successful upload
 //   ReadyOffline: Idle while Wi-Fi is down (the firmware still allows one
 //                 recording, which will then wait in the buffer)
+//   PowerOff   : the shutdown screen. Painted once, immediately before the
+//                 battery latch is released, and deliberately kept on the panel
+//                 by the e-paper's bistability with no power at all.
 enum class UiScreen {
     Ready,
     ReadyOffline,
     Recording,
     MaxReached,
+    Saving,
     Uploading,
     RetryWait,
     Sent,
+    PowerOff,
 };
 
 // Short name for serial diagnostics. Never null.
@@ -50,12 +55,16 @@ inline const char* ui_screen_name(UiScreen screen) {
             return "recording";
         case UiScreen::MaxReached:
             return "max_reached";
+        case UiScreen::Saving:
+            return "saving";
         case UiScreen::Uploading:
             return "uploading";
         case UiScreen::RetryWait:
             return "retry_wait";
         case UiScreen::Sent:
             return "sent";
+        case UiScreen::PowerOff:
+            return "power_off";
     }
     return "unknown";
 }
@@ -70,6 +79,10 @@ struct UiModel {
     bool wifi_connected = false;
     bool sent_visible = false;
     bool busy_hint_visible = false;
+    // A shutdown request was refused because a capture is in progress. The
+    // screen keeps showing the truth (RECORDING); the notice is the explicit
+    // "STOP RECORDING FIRST" overlay the specification asks for.
+    bool stop_recording_hint_visible = false;
 };
 
 // Screen for the current model.
@@ -95,6 +108,8 @@ inline UiScreen ui_screen_for(const UiModel& model) {
             return UiScreen::Recording;
         case voice_memo_firmware::AppState::MaxReachedWaitingRelease:
             return UiScreen::MaxReached;
+        case voice_memo_firmware::AppState::Saving:
+            return UiScreen::Saving;
         case voice_memo_firmware::AppState::Uploading:
             return UiScreen::Uploading;
         case voice_memo_firmware::AppState::RetryWait:
@@ -160,20 +175,28 @@ enum class UiRefresh {
 // and the host test can enumerate the combinations.
 struct UiRefreshInput {
     // The screen differs from the one currently on the panel.
-    bool screen_changed;
+    bool screen_changed = false;
     // The change is a short lived overlay (SENT confirmation, BUSY hint) that
     // must appear quickly: a flashing multi-second full refresh would miss its
     // own display window.
-    bool transient_screen;
+    bool transient_screen = false;
+    // The screen is the final POWERED OFF screen. It must be painted with the
+    // full waveform (so the image is crisp and ghost-free, because it is the
+    // last thing the panel will ever be given before power is cut) even when the
+    // firmware is not Idle - which is why it overrides the state rule below.
+    bool shutdown_screen = false;
     // Firmware state, used to decide whether blocking is acceptable.
-    voice_memo_firmware::AppState state;
+    voice_memo_firmware::AppState state = voice_memo_firmware::AppState::Idle;
     // Partial refreshes since the last full one, to bound ghosting.
-    uint32_t partials_since_full;
+    uint32_t partials_since_full = 0;
 };
 
 // Blocking the loop is only acceptable in Idle, where nothing time critical is
 // running:
 //   Recording  : I2S capture would lose samples;
+//   Saving     : the SD commit must finish so the PSRAM buffer can be freed and
+//                the next recording may start; a multi-second flashing refresh
+//                would delay exactly that;
 //   Uploading  : a BOOT press must still be sampled (it is refused, but the
 //                refusal must be logged, and the loop must stay alive);
 //   RetryWait  : same, plus the retry timer;
@@ -185,6 +208,12 @@ inline bool ui_refresh_can_block(voice_memo_firmware::AppState state) {
 }
 
 inline UiRefresh ui_refresh_for(const UiRefreshInput& input) {
+    if (input.shutdown_screen) {
+        // Nothing is running any more: the shutdown sequence only reaches this
+        // point once no recording, commit or volatile note is at risk, so the
+        // panel may take as long as it needs for a clean final image.
+        return UiRefresh::Full;
+    }
     if (input.transient_screen) {
         return UiRefresh::Partial;
     }

@@ -27,6 +27,9 @@
 #include <driver/gpio.h>
 #include <driver/spi_master.h>
 
+// Needed for VM_EPD_BUSY_TIMEOUT_MS, which is the default bound of the BUSY wait
+// below. config.h holds only preprocessor constants, so this adds no dependency.
+#include "config.h"
 #include "gfx_canvas.h"
 
 namespace voice_memo_ui {
@@ -64,6 +67,13 @@ public:
     // VM_EPD_BUSY_TIMEOUT_MS.
     bool waitIdle();
 
+    // Same wait with an explicit bound, so a caller with a different urgency can
+    // say so: the shutdown sequence uses VM_PWR_SHUTDOWN_EPD_TIMEOUT_MS while the
+    // normal UI path keeps the default. A panel that never releases BUSY is
+    // almost certainly unpowered or disconnected, and waiting forever would hang
+    // whatever called this.
+    bool waitIdleFor(uint32_t timeoutMs);
+
     // Diagnostics for the serial log / physical test.
     uint32_t lastRefreshMs() const { return lastRefreshMs_; }
     uint32_t partialRefreshCount() const { return partialRefreshCount_; }
@@ -92,7 +102,10 @@ private:
     void writeFramebufferToRam();
     void writeFramebufferAsBaseImage();
 
-    bool waitBusy(const char* stage);
+    // `timeoutMs` is explicit because the stage that fails is part of the
+    // diagnostic and the acceptable bound is not the same everywhere; the
+    // default is the normal UI bound and the shutdown path passes its own.
+    bool waitBusy(const char* stage, uint32_t timeoutMs = VM_EPD_BUSY_TIMEOUT_MS);
 
     spi_device_handle_t spi_ = nullptr;
     GfxCanvas canvas_;

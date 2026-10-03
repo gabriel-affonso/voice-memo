@@ -48,10 +48,10 @@ bool EpdDisplay::busy() const {
     return gpio_get_level(static_cast<gpio_num_t>(VM_EPD_BUSY_PIN)) == 1;
 }
 
-bool EpdDisplay::waitBusy(const char* stage) {
+bool EpdDisplay::waitBusy(const char* stage, uint32_t timeoutMs) {
     const uint32_t startMs = millis();
     while (busy()) {
-        if (static_cast<uint32_t>(millis() - startMs) > VM_EPD_BUSY_TIMEOUT_MS) {
+        if (static_cast<uint32_t>(millis() - startMs) > timeoutMs) {
             // The official driver waits forever here. A panel that never
             // releases BUSY is almost certainly unpowered or disconnected, and
             // hanging the voice memo is worse than losing the display.
@@ -65,10 +65,14 @@ bool EpdDisplay::waitBusy(const char* stage) {
 }
 
 bool EpdDisplay::waitIdle() {
+    return waitIdleFor(VM_EPD_BUSY_TIMEOUT_MS);
+}
+
+bool EpdDisplay::waitIdleFor(uint32_t timeoutMs) {
     if (faulted_) {
         return false;
     }
-    return waitBusy("idle");
+    return waitBusy("idle", timeoutMs);
 }
 
 void EpdDisplay::powerOn() {

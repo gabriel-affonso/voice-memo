@@ -6,8 +6,9 @@
 //
 //   * sampleCount_ is now a count of real 16 kHz mono samples, so
 //     duration_ms_for_samples() is elapsed wall-clock time, and
-//   * the 45 s cap (VM_MAX_RECORDING_SECONDS) still corresponds to 45 s of
-//     real audio, not 22.5 s.
+//   * the safety cap (VM_MAX_RECORDING_SECONDS) still corresponds to that many
+//     seconds of real audio, not half of them, and still fits in the board's
+//     8 MB of PSRAM.
 //
 //     c++ -std=c++11 -Wall -Wextra -o /tmp/firmware_calc_test \
 //         tests/firmware_calc_test.cpp wav_format.cpp
@@ -80,18 +81,29 @@ int main() {
     checkU32("1 s of samples", duration_ms_for_samples(VM_SAMPLE_RATE), 1000);
     checkU32("10 s of samples (160000)", duration_ms_for_samples(160000), 10000);
     checkU32("100 ms of samples (1600)", duration_ms_for_samples(1600), 100);
-    checkU32("max_samples() duration", duration_ms_for_samples(max_samples()), 45000);
+    checkU32("max_samples() duration", duration_ms_for_samples(max_samples()), 240000);
 
-    std::printf("\n== 45 s cap is 45 s of real audio ==\n");
-    checkU32("max_samples()", max_samples(), 720000);
-    checkU32("VM_MAX_RECORDING_SECONDS", VM_MAX_RECORDING_SECONDS, 45);
-    checkU32("max_samples() / VM_SAMPLE_RATE", max_samples() / VM_SAMPLE_RATE, 45);
-    checkU32("max payload bytes", max_payload_bytes(), 1440000);
-    checkTrue("max payload == 45 * bytes per second",
+    std::printf("\n== the safety cap is that many seconds of real audio ==\n");
+    checkU32("max_samples()", max_samples(), 3840000);
+    checkU32("VM_MAX_RECORDING_SECONDS", VM_MAX_RECORDING_SECONDS, 240);
+    checkU32("VM_MAX_RECORDING_MS", static_cast<uint32_t>(VM_MAX_RECORDING_MS), 240000);
+    checkU32("max_samples() / VM_SAMPLE_RATE", max_samples() / VM_SAMPLE_RATE, 240);
+    checkU32("max payload bytes", max_payload_bytes(), 7680000);
+    checkTrue("max payload == cap * bytes per second",
               max_payload_bytes() == payload_bytes_per_second() * VM_MAX_RECORDING_SECONDS);
     checkTrue("max payload holds exactly max_samples() mono samples",
               max_payload_bytes() == static_cast<size_t>(max_samples()) * VM_BYTES_PER_SAMPLE);
-    checkU32("max wav bytes", max_wav_bytes(), 1440044);
+    checkU32("max wav bytes", max_wav_bytes(), 7680044);
+
+    // The cap is bounded by PSRAM, not by taste: the whole note is captured in
+    // one PSRAM buffer before it is committed to the card, and the board has
+    // 8 MB. The 8 MB ceiling holds (8 * 1024 * 1024 - VM_WAV_HEADER_BYTES) /
+    // VM_BYTES_PER_SECOND = 262 s, so this also pins that a raise beyond 240 s
+    // would have to be deliberate.
+    checkTrue("max WAV fits the board's 8 MB PSRAM",
+              max_wav_bytes() < 8U * 1024U * 1024U);
+    checkTrue("max WAV leaves at least 512 KB of PSRAM free",
+              (8U * 1024U * 1024U) - max_wav_bytes() >= 512U * 1024U);
 
     std::printf("\n== WAV header advertises the real duration ==\n");
     const uint32_t tenSecondsPayload = static_cast<uint32_t>(VM_SAMPLE_RATE) * 10U * VM_BYTES_PER_SAMPLE;
@@ -99,16 +111,16 @@ int main() {
     checkTrue("10 s recording advertises 10.000 s",
               wavDurationSeconds(VM_SAMPLE_RATE, VM_CHANNELS, VM_BITS_PER_SAMPLE, tenSecondsPayload) > 9.999 &&
               wavDurationSeconds(VM_SAMPLE_RATE, VM_CHANNELS, VM_BITS_PER_SAMPLE, tenSecondsPayload) < 10.001);
-    checkTrue("45 s recording advertises 45.000 s",
+    checkTrue("max-length recording advertises 240.000 s",
               wavDurationSeconds(VM_SAMPLE_RATE, VM_CHANNELS, VM_BITS_PER_SAMPLE,
-                                 static_cast<uint32_t>(max_payload_bytes())) > 44.999 &&
+                                 static_cast<uint32_t>(max_payload_bytes())) > 239.999 &&
               wavDurationSeconds(VM_SAMPLE_RATE, VM_CHANNELS, VM_BITS_PER_SAMPLE,
-                                 static_cast<uint32_t>(max_payload_bytes())) < 45.001);
+                                 static_cast<uint32_t>(max_payload_bytes())) < 240.001);
 
     uint8_t header[44] = {};
     write_wav_header(header, VM_SAMPLE_RATE, VM_CHANNELS, VM_BITS_PER_SAMPLE,
                      static_cast<uint32_t>(max_payload_bytes()));
-    checkTrue("header validates against the 45 s payload",
+    checkTrue("header validates against the max-length payload",
               validate_wav_header(header, sizeof(header), VM_SAMPLE_RATE, VM_CHANNELS,
                                   VM_BITS_PER_SAMPLE, static_cast<uint32_t>(max_payload_bytes())));
     checkTrue("header is mono PCM 16-bit at 16 kHz",

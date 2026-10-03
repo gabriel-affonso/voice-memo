@@ -7,23 +7,54 @@
 // Waveshare repository README for ESP32-S3-ePaper-1.54: the V1/V2 distinction is
 // for the non-touch ePaper family and is intentionally not used here).
 
+// 0.5.0: microSD persistent queue for recordings and offline uploads.
 // 0.4.1: battery power latch (GPIO17) asserted at the top of setup().
-#define VM_FIRMWARE_VERSION "0.4.1"
+#define VM_FIRMWARE_VERSION "0.5.0"
 
 // Set to 1 only after TEST A confirms microphone capture on the physical board.
+// The three feature switches below can also be overridden from the command line
+// (`--build-property compiler.cpp.extra_flags=-DVM_ENABLE_SD=0`), which is how
+// the build variants are smoke-tested.
+#ifndef VM_ENABLE_UPLOAD
 #define VM_ENABLE_UPLOAD 1
+#endif
 
 // Set to 0 to build the pre-UI firmware (audio + upload only). The e-paper,
 // touch, battery and RTC code still compiles; nothing drives the panel and the
 // BOOT push-to-talk flow behaves exactly as before.
+#ifndef VM_ENABLE_UI
 #define VM_ENABLE_UI 1
+#endif
+
+// Set to 0 to build without the microSD queue. The firmware then behaves
+// exactly as it did before this feature existed: one PSRAM WAV buffer that must
+// be uploaded (or retried) before another recording can start. This is also the
+// automatic runtime fallback whenever the card is absent, full or unhealthy.
+#ifndef VM_ENABLE_SD
+#define VM_ENABLE_SD 1
+#endif
 
 #define VM_SAMPLE_RATE 16000
 #define VM_CHANNELS 1
 #define VM_BITS_PER_SAMPLE 16
 #define VM_BYTES_PER_SAMPLE (VM_BITS_PER_SAMPLE / 8)
 #define VM_BYTES_PER_SECOND (VM_SAMPLE_RATE * VM_CHANNELS * VM_BYTES_PER_SAMPLE)
-#define VM_MAX_RECORDING_SECONDS 45
+
+// Safety cap, not a feature limit. Recording is toggle-to-record, so this is
+// only the net that catches a capture the user forgot to stop: reaching it
+// finalizes the WAV and hands it to the normal store/upload pipeline exactly
+// like a manual stop (nothing is ever discarded).
+//
+// The real ceiling is PSRAM, not this number: the whole note is captured into
+// one PSRAM buffer before it is committed to the card, and the board's 8 MB
+// hold (8 * 1024 * 1024 - VM_WAV_HEADER_BYTES) / VM_BYTES_PER_SECOND = 262 s
+// of 16 kHz / 16-bit mono. 240 s needs 7 680 044 B and leaves ~700 KB of PSRAM
+// free for the panel framebuffer and the rest of the runtime. Do not raise this
+// without either checking `ESP.getPsramSize()` on the actual board or moving
+// capture to a streaming write (see README, "PSRAM is a temporary capture
+// buffer").
+#define VM_MAX_RECORDING_SECONDS 240
+#define VM_MAX_RECORDING_MS (VM_MAX_RECORDING_SECONDS * 1000UL)
 #define VM_MAX_PAYLOAD_BYTES (VM_BYTES_PER_SECOND * VM_MAX_RECORDING_SECONDS)
 #define VM_WAV_HEADER_BYTES 44
 #define VM_MAX_WAV_BYTES (VM_WAV_HEADER_BYTES + VM_MAX_PAYLOAD_BYTES)
@@ -137,15 +168,108 @@
 #define VM_UPLOAD_TIMEOUT_MS 15000
 
 // Background upload task (VM_ENABLE_UPLOAD=1 only).
-// The upload runs on its own FreeRTOS task so RecordingApp::tick() keeps
-// running and the BOOT button stays responsive while HTTP is in flight.
-// 8 KB is conservative for WiFiClient + String multipart framing over plain
-// HTTP (no TLS) and keeps the 1.44 MB WAV in PSRAM, never on this stack.
-// Priority 1 matches the Arduino loop task: the uploader must never outrank
-// I2S audio capture. The task is deliberately NOT pinned to a core; it is
-// almost always blocked on the socket, so it does not compete with audio.
-#define VM_UPLOAD_TASK_STACK_BYTES 8192
+// The upload/persist job runs on its own FreeRTOS task so RecordingApp::tick()
+// keeps running and the BOOT button stays responsive while HTTP is in flight.
+// 12 KB covers WiFiClient + String multipart framing over plain HTTP (no TLS),
+// the VM_UPLOAD_CHUNK_BYTES streaming buffer (4 KB) and the deepest String
+// temporaries, while the WAV (up to VM_MAX_WAV_BYTES, 7.7 MB) is never copied
+// onto this stack: it is either in PSRAM or streamed from the card in chunks.
+// Priority 1 matches the Arduino loop task: the worker must never outrank I2S
+// audio capture. The task is deliberately NOT pinned to a core; it is almost
+// always blocked on the socket, so it does not compete with audio.
+#define VM_UPLOAD_TASK_STACK_BYTES 12288
 #define VM_UPLOAD_TASK_PRIORITY 1
+
+// ============================================================================
+// microSD card - Waveshare ESP32-S3-Touch-ePaper-1.54 (SKU 34211/34212)
+// ============================================================================
+// The card is wired as **1-bit SDMMC**, not SPI. Official sources for THIS
+// board (there is no separate touch-only repository):
+//
+//   waveshareteam/ESP32-S3-ePaper-1.54 @ 9957d0f4
+//     02_Example/Arduino/04_SD_Card/sdcard_bsp.cpp
+//         #define SDMMC_D0_PIN  GPIO_NUM_40
+//         #define SDMMC_CLK_PIN GPIO_NUM_39
+//         #define SDMMC_CMD_PIN GPIO_NUM_41
+//         sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+//         slot_config.width = 1;                 // 1-wire SDMMC
+//         slot_config.clk = SDMMC_CLK_PIN;
+//         slot_config.cmd = SDMMC_CMD_PIN;
+//         slot_config.d0  = SDMMC_D0_PIN;
+//         host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+//     02_Example/ESP-IDF/V{1,2}/04_SD_Card/.../sdcard_bsp.c   (identical)
+//     02_Example/ESP-IDF/V2/11_FactoryProgram/components/port_bsp/epaper_config.h
+//         #define SD_MISO_D0_PIN  GPIO_NUM_40
+//         #define SD_MOSI_CMD_PIN GPIO_NUM_41
+//         #define SD_CLK_PIN      GPIO_NUM_39
+//         #define SDlist "/sdcard"
+//
+// The official schematic (ESP32-S3-Touch-ePaper-1.54-Schematic.pdf) confirms
+// the same three nets - IO39 SD_CLK, IO40 SD_MISO, IO41 SD_MOSI - and shows
+// that DATA1/DATA2 are only routed to unpopulated resistors, DATA3/CS has a
+// pull-up but no GPIO, card-detect is tied to GND, and the socket's VDD is on
+// the always-on 3V3 rail. There is therefore NO chip-select, NO card-detect and
+// NO SD power-enable GPIO to drive, and no pin overlaps with the e-paper (SPI2
+// 6/8/9/10/11/12/13), touch/I2C (7/21/47/48) or audio (14/15/16/38/42/45/46).
+//
+// The Arduino `SD_MMC` wrapper drives exactly this ESP-IDF SDMMC driver, so
+// `SD_MMC.setPins(39, 41, 40)` + `SD_MMC.begin("/sdcard", true)` is used. The
+// official example calls `esp_vfs_fat_sdmmc_mount()` directly; the pin numbers,
+// 1-bit width, mount point and clock are the official ones either way.
+//
+// NOTE: 39/40/41 are also the ESP32-S3 external-JTAG pins (MTCK/MTDO/MTDI).
+// That is irrelevant unless the JTAG eFuses are burned; this board debugs over
+// the built-in USB_SERIAL_JTAG on IO19/IO20.
+#define VM_SD_MOUNT_POINT "/sdcard"
+#define VM_SD_CLK_PIN 39
+#define VM_SD_CMD_PIN 41
+#define VM_SD_D0_PIN 40
+#define VM_SD_FREQ_KHZ 40000  // SDMMC_FREQ_HIGHSPEED, as in the official example
+#define VM_SD_MAX_OPEN_FILES 8
+
+// Root of the persistent layout (see recording_paths.h). Never the mount point
+// itself: the card may contain unrelated files.
+#define VM_SD_ROOT "/voice_memo"
+
+// Backpressure. A commit is refused (and the recording kept in PSRAM for the
+// legacy path) when either limit would be crossed. VM_SD_MIN_FREE_BYTES is the
+// reserve that must remain *after* the write, so the card always keeps room for
+// its filesystem metadata; it is not a per-file limit.
+#define VM_SD_MAX_PENDING 64
+#define VM_SD_MIN_FREE_BYTES (1024ULL * 1024ULL)
+
+// After an I/O error the volume is considered unhealthy and a full
+// unmount+remount is retried at most this often. Deliberately slow: no polling
+// storm while the card is out.
+#define VM_SD_RETRY_MOUNT_MS 30000UL
+
+// 0: after a confirmed upload, delete WAV + metadata (default policy).
+// 1: move them to <root>/sent/ instead, which keeps the retention hook alive.
+#define VM_SD_KEEP_SENT 0
+
+// 1: re-hash every recovered pending WAV at boot and quarantine a CRC mismatch.
+// Off by default: a max-length recording is ~7.7 MB, and hashing a full queue would
+// add seconds to the boot. The cheap structural checks always run.
+#define VM_SD_VERIFY_CRC_ON_BOOT 0
+
+// 1: run the write/read/verify/remove self test in <root>/tmp on every boot.
+// Bring-up only; leave 0 in production.
+#define VM_SD_SELF_TEST 0
+
+// Chunk size used to stream a WAV from the card into the multipart body. The
+// whole file is never copied into RAM: the body is written chunk by chunk.
+#define VM_UPLOAD_CHUNK_BYTES 4096
+
+// Retry cadence for the persistent queue. Separate from the volatile
+// VM_UPLOAD_RETRY_INTERVAL_MS so a slow link cannot couple the two paths.
+#define VM_SD_QUEUE_RETRY_INTERVAL_MS 5000
+
+// Attempts after which one queued recording stops being retried at the normal
+// cadence: it is skipped so it cannot starve newer notes, and retried only at
+// the slow backoff below. Nothing is ever deleted or quarantined for failing to
+// upload - the recording stays on the card and keeps its id.
+#define VM_SD_QUEUE_MAX_ATTEMPTS 10
+#define VM_SD_QUEUE_MAX_BACKOFF_MS 600000UL  // 10 minutes
 
 // ============================================================================
 // UI hardware - every value below comes from the official Waveshare sources for
@@ -210,6 +334,104 @@
 #define VM_VBAT_PWR_PIN 17
 #define VM_PWR_KEY_PIN 18
 
+// ============================================================================
+// PWR key polarity - CONFIRMED, not assumed
+// ============================================================================
+// GPIO18 (net BAT_KEY) is ACTIVE LOW: the key shorts the net to GND and the net
+// is held up by a 10K pull-up (R58 to 3V3 on the official schematic,
+// ESP32-S3-Touch-ePaper-1.54-Schematic.pdf) plus the ESP32-S3's internal
+// pull-up. Pressed = LOW, released = HIGH.
+//
+// Two independent official sources agree:
+//   1. 02_Example/Arduino/07_BATT_PWR_Test/src/button_bsp/button_bsp.c
+//        #define button2_active 0        // PWR: active level = 0 (LOW)
+//        gpio_conf.mode = GPIO_MODE_INPUT;
+//        gpio_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+//        gpio_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+//      and the same file reads the key with gpio_get_level(PWR_BUTTON_PIN).
+//   2. 02_Example/Arduino/11_RTC_Sleep_Test/src/power/board_power_bsp.cpp
+//        const uint64_t ext_wakeup_pwr_mask = 1ULL << GPIO_NUM_18;
+//        esp_sleep_enable_ext1_wakeup_io(..., ESP_EXT1_WAKEUP_ANY_LOW);
+//      i.e. Waveshare itself wakes the chip when GPIO18 goes LOW.
+//
+// NOTE (recorded so nobody re-derives it wrongly): 07_BATT_PWR_Test's
+// user_app.cpp contains `vbat_scanStatus()` which sets its arming flag when
+// gpio_get_level(PWR_BUTTON_PIN) is non-zero, and `button_power_task()` which
+// powers off when that flag is set. That pair is inverted relative to the
+// button polarity declared in the very same example, so it is self-
+// contradictory; the schematic, the active-low declaration and the EXT1
+// ANY_LOW wake source are the consistent evidence and are what this firmware
+// follows. Validate on hardware with TEST B (README).
+//
+// Guarded so the polarity can be flipped from the command line during physical
+// validation instead of editing this file:
+//     --build-property compiler.cpp.extra_flags=-DVM_PWR_KEY_ACTIVE_LOW=0
+// The #ifndef is also what keeps "macro redefined" out of a -Warnings all build
+// when that override is used.
+#ifndef VM_PWR_KEY_ACTIVE_LOW
+#define VM_PWR_KEY_ACTIVE_LOW 1
+#endif
+
+// Debounce window for the PWR key. The official example runs the multi_button
+// library from a 5 ms esp_timer tick with its default 50 ms debounce window, so
+// 50 ms is the vendor-consistent value rather than a guess. It is comfortably
+// above the mechanical bounce of a tactile switch (a few ms) and well below any
+// deliberate human press (>= 150 ms).
+#define VM_PWR_DEBOUNCE_MS 50
+
+// ============================================================================
+// Automatic power-off after inactivity
+// ============================================================================
+// "Inactivity" means no *user* interaction. Background work (Wi-Fi, NTP, RTC,
+// uploads, e-paper refreshes, SD remounts, log lines) never resets the timer;
+// see power_policy.h for the single place that classification lives.
+// The #ifndef guard is load-bearing: `--build-property
+// compiler.cpp.extra_flags=-DVM_ENABLE_AUTO_POWER_OFF=0` overrides it, exactly
+// like the VM_ENABLE_SD / VM_ENABLE_UI / VM_ENABLE_UPLOAD switches above.
+#ifndef VM_ENABLE_AUTO_POWER_OFF
+#define VM_ENABLE_AUTO_POWER_OFF 1
+#endif
+#define VM_AUTO_POWER_OFF_MS 120000UL
+
+// Manual PWR short press always requests a graceful shutdown, independent of
+// the inactivity timeout.
+#ifndef VM_ENABLE_MANUAL_POWER_OFF
+#define VM_ENABLE_MANUAL_POWER_OFF 1
+#endif
+
+// Bounded waits in the shutdown path. Every one is a deadline, never a delay()
+// in normal operation; the shutdown path is allowed to block briefly because
+// the device is going away and nothing else needs the CPU.
+//   * how long a freshly painted POWERED OFF screen may take
+#define VM_PWR_SHUTDOWN_EPD_TIMEOUT_MS 6000UL
+//   * how long an interrupted background upload may take to notice the abort
+//     flag and hand the worker back. The flag is polled between 4 KB chunks, so
+//     this only has to cover one in-flight HTTP write.
+#define VM_PWR_UPLOAD_ABORT_TIMEOUT_MS 500UL
+//   * how long the SD volume may take to become releasable at shutdown. A commit
+//     is never interrupted, so a slower-than-expected one is waited out here;
+//     the bound only exists so a wedged card cannot hang the power-off.
+#define VM_PWR_SHUTDOWN_CARD_RELEASE_TIMEOUT_MS 2000UL
+//   * how long the main loop is serviced (button, outcome drain) between
+//     shutdown polls.
+#define VM_PWR_SHUTDOWN_POLL_MS 10UL
+
+// Deep-sleep wake source for the PWR key. When 1, powerOff() releases the
+// battery latch and then enters deep sleep with GPIO18 (an ESP32-S3 RTC GPIO)
+// armed for EXT1 wake on LOW. On battery the latch release removes power before
+// the sleep even starts; on USB, where VBUS keeps the board alive, deep sleep
+// is what makes the device actually behave as "off" while the e-paper keeps its
+// last image. This is exactly what the official 11_RTC_Sleep_Test example does
+// with the same pin (see the polarity note above).
+//
+// The #ifndef guard is load-bearing, like the other feature switches: with
+// `-DVM_PWR_WAKE_ON_PWR=0` the deep sleep is skipped and only the latch is
+// released, which leaves the device running on USB. Without the guard that
+// override produced a "macro redefined" warning and the override silently lost.
+#ifndef VM_PWR_WAKE_ON_PWR
+#define VM_PWR_WAKE_ON_PWR 1
+#endif
+
 // Battery rail: ADC1 channel 3 = GPIO4, 12 dB attenuation, /2 divider.
 #define VM_BATTERY_ADC_CHANNEL 3
 #define VM_BATTERY_DIVIDER_RATIO 2
@@ -272,6 +494,11 @@
 // partial refresh was *started*, because the panel needs ~0.3-0.5 s to show it.
 #define VM_UI_SENT_HOLD_MS 1500
 #define VM_UI_BUSY_HINT_MS 1000
+
+// Minimum time a power notice ("STOP RECORDING FIRST") stays on the panel after
+// its condition has cleared. The notice is otherwise event-driven: it is shown
+// because something happened, not because a timer asked for it.
+#define VM_UI_POWER_NOTICE_MIN_HOLD_MS 1200
 
 // Battery is sampled at most this often, and re-rendered only on a change of at
 // least VM_UI_BATTERY_RENDER_DELTA percent.
